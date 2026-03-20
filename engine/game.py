@@ -113,8 +113,9 @@ class BomberEnv:
         tiles = {(bomb.x, bomb.y)}
         directions = [(1, 0), (-1, 0), (0, 1), (0, -1)]
         
+        # bomb.radius already includes owner's bonus at placement time
         for dx, dy in directions:
-            for r in range(1, bomb.radius + self.players[bomb.owner_id].bomb_radius_bonus + 1):
+            for r in range(1, bomb.radius + 1):
                 tx, ty = bomb.x + dx * r, bomb.y + dy * r
                 if 0 <= tx < self.height and 0 <= ty < self.width:
                     if self.map.grid[tx, ty] == Map.WALL:
