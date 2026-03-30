@@ -17,7 +17,7 @@ class Map:
         self.height = height
         self.rng = np.random.default_rng(seed)
         self.box_spawn_probability = 0.3
-        self.par = {}
+        self.par = np.zeros(self.width * self.height, dtype=np.int32)
         self.grid = np.zeros((height, width), dtype=int)
         self._setup_walls()
         self._generate_map()
@@ -41,17 +41,18 @@ class Map:
 
     def _ensure_connectivity(self):
         walls_coordinates = []
-        
+
+        self.par = np.zeros(self.width * self.height, dtype=np.int32)
+
         def find(u):
-            if u not in self.par:
+            if self.par[u] == 0:
                 self.par[u] = -1
             if self.par[u] < 0:
                 return u
             self.par[u] = find(self.par[u])
             return self.par[u]
+        
         def merge(s, t):
-            if s == t:
-                return
             if self.par[s] < self.par[t]:
                 s, t = t, s
             self.par[t] += self.par[s]
@@ -71,9 +72,9 @@ class Map:
                                 merge(s, t)
                 else:
                     walls_coordinates.append((row, col))
-                    
+
         self.rng.shuffle(walls_coordinates)
-        
+
         for row, col in walls_coordinates:
             components = set()
             for d in range(4):
@@ -82,10 +83,37 @@ class Map:
                     components.add(find(self._convert(nrow, ncol)))
             if len(components) > 1:
                 self.grid[row, col] = self.GRASS # break wall
+                new_cell = self._convert(row, col)
                 for u in components:
-                    merge(u, find(self._convert(row, col)))
+                    s, t = u, find(new_cell)
+                    if s != t:
+                        merge(s, t)
         
-        
+        # For 100% robustness, repeat until only 1 component
+        while True:
+            components = set()
+            for row in range(1, self.height - 1):
+                for col in range(1, self.width - 1):
+                    if self.grid[row, col] != self.WALL:
+                        components.add(find(self._convert(row, col)))
+            if len(components) == 1:
+                break
+            else:
+                for row in range(1, self.height - 1):
+                    for col in range(1, self.width - 1):
+                        if self.grid[row, col] == self.WALL:
+                            if self.rng.random() < 0.2:
+                                self.grid[row, col] = self.GRASS
+                                for d in range(4):
+                                    nrow, ncol = row + dx[d], col + dy[d]
+                                    if not self._is_wall(nrow, ncol):
+                                        u, v = self._convert(row, col), self._convert(nrow, ncol)
+                                        s = find(u)
+                                        t = find(v)
+                                        if s != t:
+                                            merge(s, t)
+
+
     def _generate_map(self):        
         # Wall cells = [2, 2], [2, 4],... [4, 2], [4, 4], ...
         self.grid[2:self.height - 1:2, 2:self.width - 1:2] = self.WALL
@@ -95,15 +123,18 @@ class Map:
                 if self.grid[row, col] == 0 and self.rng.random() < 0.2:
                     self.grid[row, col] = self.WALL
         
-        # DSU
-        self._ensure_connectivity()
-        
         # for any 2x2, cannot be four wall cells
         for row in range(1, self.height - 2):
             for col in range(1, self.width - 2):
                 if self.grid[row:row+2, col:col+2].tolist() == [[self.WALL, self.WALL], [self.WALL, self.WALL]]:
                     # randomly convert one wall to grass
                     self.grid[row + self.rng.integers(0, 2), col + self.rng.integers(0, 2)] = self.GRASS
+        
+        # 2x2 safe area at spawn positions
+        self.grid[1:3, 1:3] = self.GRASS
+        self.grid[1:3, self.width - 3:self.width - 1] = self.GRASS
+        self.grid[self.height - 3:self.height - 1, 1:3] = self.GRASS
+        self.grid[self.height - 3:self.height - 1, self.width - 3:self.width - 1] = self.GRASS
         
         # for any starting position, if there are >= 4 wall cells to the right or down, convert one to grass
         for row in range(1, self.height - 1):
@@ -113,12 +144,15 @@ class Map:
                 if row < self.height - 4 and self.grid[row:row+4, col].flatten().tolist() == [self.WALL, self.WALL, self.WALL, self.WALL]:
                     self.grid[row + self.rng.integers(0, 4), col] = self.GRASS
         
+        # DSU
+        self._ensure_connectivity()
+        
         # Add boxes
         for row in range(1, self.height - 1):
             for col in range(1, self.width - 1):
                 if self.grid[row, col] == self.GRASS and self.rng.random() < self.box_spawn_probability:
                     self.grid[row, col] = self.BOX
-
+                    
         # 2x2 safe area at spawn positions
         self.grid[1:3, 1:3] = self.GRASS
         self.grid[1:3, self.width - 3:self.width - 1] = self.GRASS

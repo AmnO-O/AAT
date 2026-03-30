@@ -41,7 +41,7 @@ class BomberEnv:
             "bombs": np.array([[b.x, b.y, b.timer, b.owner_id] for b in self.bombs], dtype=np.int8)
         }
         
-    # Resolution: actions first (movement, bomb placement) -> bomb explosion -> check termination
+    # Resolution: actions first (movement, bomb placement) -> bomb explosion -> spawn items -> check termination
     def step(self, actions):
         self.current_step += 1
         pending_bombs = {}
@@ -103,6 +103,7 @@ class BomberEnv:
             
             self._apply_explosions(all_affected_tiles)
             self.bombs = [b for b in self.bombs if not b.exploded]
+        self._spawn_random_items()
         
         terminated = sum(p.alive for p in self.players) <= 1
         truncated = self.current_step >= self.max_steps
@@ -144,3 +145,16 @@ class BomberEnv:
             # can destroy items
             elif self.map.grid[tx, ty] in [Map.ITEM_RADIUS, Map.ITEM_CAPACITY]:
                 self.map.grid[tx, ty] = Map.GRASS
+        
+    def _spawn_random_items(self, spawn_prob=0.0003):
+        for x in range(self.height):
+            for y in range(self.width):
+                if self.map.grid[x, y] != Map.GRASS:
+                    continue
+                if any(p.x == x and p.y == y and p.alive for p in self.players):
+                    continue
+                if self.rng.random() < spawn_prob * self.current_step / 165:
+                    if self.rng.random() < 0.5:
+                        self.map.grid[x, y] = Map.ITEM_RADIUS
+                    else:
+                        self.map.grid[x, y] = Map.ITEM_CAPACITY
