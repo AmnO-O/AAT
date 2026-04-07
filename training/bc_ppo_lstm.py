@@ -7,6 +7,7 @@ rewards from reward_02.py. Supports --parallel_envs N for vectorized rollouts.
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 import os
 import random
 import sys
@@ -366,6 +367,7 @@ def train_bc_ppo_lstm(
     load_checkpoint_path: str | None = None,
     skip_bc: bool = False,
     device: str | None = None,
+    reward_log_episodes: int = 3,
 ):
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -417,11 +419,19 @@ def train_bc_ppo_lstm(
 
     rng = np.random.default_rng(seed + 90210)
 
+    ep_reward_sum = [0.0] * n_env
+    ep_comp_sum: list[defaultdict[str, float]] = [defaultdict(float) for _ in range(n_env)]
+    ep_log_this = [False] * n_env
+    reward_log_done = 0
+
     def reset_env_state(ei: int):
         obs = envs[ei].reset(seed=int(rng.integers(0, 2**31 - 1)))
         m, a = encode_obs(obs, agent_ids)
         ep = EpisodeRewardState()
         prev = None
+        ep_reward_sum[ei] = 0.0
+        ep_comp_sum[ei].clear()
+        ep_log_this[ei] = reward_log_episodes > 0 and reward_log_done < reward_log_episodes
         return obs, m, a, ep, prev
 
     obs_l, map_l, aux_l, ep_l, prev_l = zip(*[reset_env_state(i) for i in range(n_env)])
@@ -484,10 +494,29 @@ def train_bc_ppo_lstm(
                     act_list[e.agent_id] = e.act(obs_l[n])
                 next_obs, term, trunc = envs[n].step(act_list)
                 done = term or trunc
-                r, ep_l[n] = compute_reward_icec(prev_l[n], next_obs, user_id, ep_l[n])
+                if ep_log_this[n]:
+                    comp_buf: dict[str, float] = {}
+                    r, ep_l[n] = compute_reward_icec(
+                        prev_l[n], next_obs, user_id, ep_l[n], out_components=comp_buf
+                    )
+                    ep_reward_sum[n] += r
+                    for k, v in comp_buf.items():
+                        if k not in ("dense_decay", "dense_applied"):
+                            ep_comp_sum[n][k] += float(v)
+                else:
+                    r, ep_l[n] = compute_reward_icec(prev_l[n], next_obs, user_id, ep_l[n])
                 stor_rew[t, n] = r
                 stor_done[t, n] = float(done)
                 if done:
+                    if ep_log_this[n]:
+                        print(
+                            f"[reward components] finished_episode={reward_log_done + 1}/"
+                            f"{reward_log_episodes} env={n} return={ep_reward_sum[n]:.4f}"
+                        )
+                        keys = sorted(ep_comp_sum[n].keys(), key=lambda x: (x == "total", x))
+                        for k in keys:
+                            print(f"    {k}: {ep_comp_sum[n][k]:.6f}")
+                        reward_log_done += 1
                     obs_l[n], map_l[n], aux_l[n], ep_l[n], prev_l[n] = reset_env_state(n)
                 else:
                     obs_l[n] = next_obs
@@ -635,6 +664,12 @@ if __name__ == "__main__":
     parser.add_argument("--load_checkpoint", type=str, default=None)
     parser.add_argument("--skip_bc", action="store_true")
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument(
+        "--reward-log-episodes",
+        type=int,
+        default=3,
+        help="Print per-component reward sums for the first N completed episodes (0 = off).",
+    )
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -666,4 +701,5 @@ if __name__ == "__main__":
         load_checkpoint_path=args.load_checkpoint,
         skip_bc=args.skip_bc,
         device=args.device,
+        reward_log_episodes=args.reward_log_episodes,
     )
