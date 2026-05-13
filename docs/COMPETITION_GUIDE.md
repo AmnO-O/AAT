@@ -304,12 +304,12 @@ There are **6 rule-based baseline agents** with fixed ratings (do not change dur
 
 | Name | Strategy | Score (μ − 3σ) |
 |---|---|---|
-| `tactical_rule_agent` | Dodges danger, finds items, targets enemies, calculates bomb placement | ~114.1 |
-| `genius_rule_agent` | Balanced offense/defense, BFS pathfinding | ~111.9 |
-| `smarter_rule_agent` | Prioritizes boxes, dodges bombs, chases enemies | ~108.6 |
-| `box_farmer_agent` | Focuses on breaking boxes for items | ~107.9 |
-| `simple_rule_agent` | Simple rules: dodge bombs, place bombs | ~100.2 |
-| `random_agent` | Random actions | ~50.0 |
+| `tactical_rule_agent` | Dodges danger, finds items, targets enemies, calculates bomb placement | ~115.3 |
+| `genius_rule_agent` | Balanced offense/defense, BFS pathfinding | ~114.1 |
+| `smarter_rule_agent` | Prioritizes boxes, dodges bombs, chases enemies | ~111.1 |
+| `box_farmer_agent` | Focuses on breaking boxes for items | ~108.6 |
+| `simple_rule_agent` | Simple rules: dodge bombs, place bombs | ~108.0 |
+| `random_agent` | Random actions | ~100.3 |
 
 Additionally, an **RL-based agent** (`dqn_agent`) is provided as a reference.
 
@@ -319,7 +319,9 @@ Additionally, an **RL-based agent** (`dqn_agent`) is provided as a reference.
 
 1. [Reinforcement Learning: An Introduction, Andrew Barto and Richard S. Sutton](http://incompleteideas.net/book/the-book-2nd.html)
 2. [Reinforcement Learning Course, University of Toronto](https://bereyhi-courses.github.io/rl-utoronto/)
-3. [Reinforcement Learning Exercises, AI VIETNAM](https://www.facebook.com/share/1B4BpDUbyx/)
+3. [Neuriton](https://www.facebook.com/share/1B4BpDUbyx/)
+4. [Reinforcement Learning Exercises, AI VIETNAM](https://www.facebook.com/share/p/192LyNsvbp/)
+5. [RL Algorithms Single File Codes](https://github.com/vwxyzjn/cleanrl)
 
 ---
 

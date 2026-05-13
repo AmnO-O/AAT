@@ -23,7 +23,7 @@ load_env()
 
 DEFAULT_DB_PATH = str(ROOT_DIR / "competition.db")
 DEFAULT_LOG_DIR = str(ROOT_DIR / "logs")
-EVALUATION_LOCK_FILE = ROOT_DIR / ".evaluation_lock"
+EVALUATION_LOCK_DIR = ROOT_DIR / ".evaluation_locks"
 
 DEFAULT_N_MATCHES = 25
 DEFAULT_MAX_STEPS = 500
@@ -234,10 +234,13 @@ def run_submission_batch(
     enable_gif: bool = True,
     enable_timing_logs: bool = True,
 ):
+    # Create a per-submission lock file in the shared lock directory
+    lock_file = EVALUATION_LOCK_DIR / submission_id
     try:
-        EVALUATION_LOCK_FILE.touch(exist_ok=True)
+        EVALUATION_LOCK_DIR.mkdir(exist_ok=True)
+        lock_file.touch(exist_ok=True)
     except Exception as e:
-        logger.warning("Could not create evaluation lock: %s", e)
+        logger.warning("Could not create evaluation lock for %s: %s", submission_id, e)
 
     total_started = time.perf_counter()
     parallel_workers = max(1, int(parallel_workers))
@@ -484,10 +487,18 @@ def run_submission_batch(
         )
 
     try:
-        if EVALUATION_LOCK_FILE.exists():
-            EVALUATION_LOCK_FILE.unlink()
+        lock_file = EVALUATION_LOCK_DIR / submission_id
+        if lock_file.exists():
+            lock_file.unlink()
+        
+        # Try to remove the directory if it's now empty (non-blocking)
+        if EVALUATION_LOCK_DIR.exists() and not any(EVALUATION_LOCK_DIR.iterdir()):
+            try:
+                EVALUATION_LOCK_DIR.rmdir()
+            except Exception:
+                pass
     except Exception as e:
-        logger.warning("Could not remove evaluation lock: %s", e)
+        logger.warning("Could not remove evaluation lock for %s: %s", submission_id, e)
 
     return result
 
@@ -508,8 +519,9 @@ def run_background_cycle(
     enable_gif: bool = True,
     enable_timing_logs: bool = True,
 ):
-    if EVALUATION_LOCK_FILE.exists():
-        return {"status": "skipped", "message": "Yielding to submission batch (lock file present)."}
+    # Yield to ANY active submission batches
+    if EVALUATION_LOCK_DIR.exists() and any(EVALUATION_LOCK_DIR.iterdir()):
+        return {"status": "skipped", "message": "Yielding to active submission batches (lock directory not empty)."}
 
     total_started = time.perf_counter()
     parallel_workers = max(1, int(parallel_workers))
