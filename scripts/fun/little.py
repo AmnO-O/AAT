@@ -32,7 +32,7 @@ INPUT_CHANNELS = 20
 BOARD_SIZE = 13
 NUM_ACTIONS = 6
 
-INITIAL_GAMES = 1000
+INITIAL_GAMES = 10
 DAGGER_ROUNDS = 2
 DAGGER_GAMES_PER_ROUND = 200
 MAX_STEPS = 500
@@ -673,8 +673,10 @@ def run_epoch(model: nn.Module, loader: DataLoader, criterion, optimizer=None):
     total_correct = 0
     total_count = 0
 
+    print("Running epoch over {} samples...".format(len(loader.dataset)))
+
     for states, actions in loader:
-        print(f"  Processing batch {total_count}/{len(loader.dataset)}", end="\r")
+        print(f"  Processing batch {total_count}/{len(loader.dataset)}")
 
         states = states.to(DEVICE, non_blocking=True)
         actions = actions.to(DEVICE, non_blocking=True)
@@ -718,8 +720,11 @@ def train_policy_model(train_dir: str, val_dir: str, init_model_path: str | None
     patience_left = PATIENCE
 
     for epoch in range(1, EPOCHS + 1):
+        print(f"Epoch {epoch}/{EPOCHS} | lr={optimizer.param_groups[0]['lr']:.2e}")
         train_loss, train_acc = run_epoch(model, train_loader, criterion, optimizer=optimizer)
+        print(f"Epoch {epoch}/{EPOCHS} | train_loss={train_loss:.4f} train_acc={train_acc:.4f} | Evaluating on validation set...")
         val_loss, val_acc = run_epoch(model, val_loader, criterion, optimizer=None)
+
         scheduler.step(val_loss)
 
         print(
