@@ -153,9 +153,10 @@ def run_match(agent_paths, num_episodes=10, max_steps=500, seed=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--agent_paths", nargs="+", default=["None", "None", "None", "None"],
+    parser.add_argument("--agent_paths", nargs="+", default=["agent/tactical_rule_agent.py", "agent/genius_rule_agent.py", 
+                                                             "agent/tactical_rule_agent.py", "agent/smarter_rule_agent.py"],
                         help="Paths to agent.py files, agent folders, or baseline names (e.g. RandomAgent). Use 'None' for a random baseline.")
-    parser.add_argument("--num_episodes", type=int, default=10)
+    parser.add_argument("--num_episodes", type=int, default=100)
     parser.add_argument("--max_steps", type=int, default=500)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--visualize", type=str2bool, default=False)
