@@ -674,6 +674,8 @@ def run_epoch(model: nn.Module, loader: DataLoader, criterion, optimizer=None):
     total_count = 0
 
     for states, actions in loader:
+        print(f"  Processing batch {total_count}/{len(loader.dataset)}", end="\r")
+
         states = states.to(DEVICE, non_blocking=True)
         actions = actions.to(DEVICE, non_blocking=True)
 
@@ -692,6 +694,7 @@ def run_epoch(model: nn.Module, loader: DataLoader, criterion, optimizer=None):
         preds = torch.argmax(logits, dim=1)
         total_correct += int((preds == actions).sum().item())
         total_count += int(states.size(0))
+        print(f"total loss {total_loss:.4f} | acc {total_correct / max(1, total_count):.4f}", end="\r")
 
     avg_loss = total_loss / max(1, total_count)
     acc = total_correct / max(1, total_count)
