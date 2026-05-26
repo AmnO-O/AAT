@@ -32,7 +32,7 @@ INPUT_CHANNELS = 20
 BOARD_SIZE = 13
 NUM_ACTIONS = 6
 
-INITIAL_GAMES = 100
+INITIAL_GAMES = 500
 DAGGER_ROUNDS = 2
 DAGGER_GAMES_PER_ROUND = 200
 MAX_STEPS = 500
@@ -40,7 +40,7 @@ MAX_STEPS = 500
 TRAIN_SPLIT_MOD = 10  # seed % 10 == 0 -> validation, otherwise training
 
 CHUNK_SIZE = 2048
-BATCH_SIZE = 128
+BATCH_SIZE = 256
 EPOCHS = 20
 LEARNING_RATE = 1e-3
 FINE_TUNE_LR = 3e-4
@@ -649,7 +649,7 @@ def build_loaders(train_dir: str, val_dir: str):
         train_ds,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=2,
+        num_workers=4,
         pin_memory=(DEVICE.type == "cuda"),
         drop_last=False,
     )
@@ -657,7 +657,7 @@ def build_loaders(train_dir: str, val_dir: str):
         val_ds,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=2,
+        num_workers=4,
         pin_memory=(DEVICE.type == "cuda"),
         drop_last=False,
     )
@@ -672,7 +672,7 @@ def run_epoch(model: nn.Module, loader: DataLoader, criterion, optimizer=None):
     total_loss = 0.0
     total_correct = 0
     total_count = 0
-
+    
     print("Running epoch over {} samples...".format(len(loader.dataset)))
 
     for states, actions in loader:
@@ -696,7 +696,9 @@ def run_epoch(model: nn.Module, loader: DataLoader, criterion, optimizer=None):
         preds = torch.argmax(logits, dim=1)
         total_correct += int((preds == actions).sum().item())
         total_count += int(states.size(0))
+
         print(f"total loss {total_loss:.4f} | acc {total_correct / max(1, total_count):.4f}", end="\r")
+        
 
     avg_loss = total_loss / max(1, total_count)
     acc = total_correct / max(1, total_count)
@@ -720,11 +722,11 @@ def train_policy_model(train_dir: str, val_dir: str, init_model_path: str | None
     patience_left = PATIENCE
 
     for epoch in range(1, EPOCHS + 1):
-        print(f"Epoch {epoch}/{EPOCHS} | lr={optimizer.param_groups[0]['lr']:.2e}")
         train_loss, train_acc = run_epoch(model, train_loader, criterion, optimizer=optimizer)
+        
         print(f"Epoch {epoch}/{EPOCHS} | train_loss={train_loss:.4f} train_acc={train_acc:.4f} | Evaluating on validation set...")
+        
         val_loss, val_acc = run_epoch(model, val_loader, criterion, optimizer=None)
-
         scheduler.step(val_loss)
 
         print(
