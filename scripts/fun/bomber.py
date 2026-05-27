@@ -699,9 +699,9 @@ class BomberNet(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.blocks = nn.Sequential(
-            ResidualBlock(width, dropout=0.05),
-            ResidualBlock(width, dropout=0.05),
-            ResidualBlock(width, dropout=0.05),
+            ResidualBlock(width, dropout=0.1),
+            ResidualBlock(width, dropout=0.1),
+            ResidualBlock(width, dropout=0.1),
         )
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.head = nn.Sequential(
