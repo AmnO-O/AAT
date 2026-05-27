@@ -309,6 +309,11 @@ def legal_actions(grid: np.ndarray, bombs: np.ndarray, my_pos: Tuple[int, int], 
     return moves
 
 
+def movement_actions_from_legal(legal: Iterable[int]) -> List[int]:
+    """Return only movement actions, never bomb placement."""
+    return [int(a) for a in legal if int(a) in (1, 2, 3, 4)]
+
+
 # =============================================================================
 # Observation encoding
 # =============================================================================
@@ -557,14 +562,12 @@ class TeacherEnsemble:
         danger = danger_plane(grid, players, bombs, timer_threshold=1)
         if danger[r, c] > 0.0:
             safe_acts = []
-            for a in legal:
-                if a == 0:
-                    continue
+            for a in movement_actions_from_legal(legal):
                 nr, nc = next_pos((r, c), a)
                 if in_bounds(nr, nc) and danger[nr, nc] == 0.0:
                     safe_acts.append(a)
             if safe_acts:
-                # keep tactical priority, but only among safe actions
+                # keep tactical priority, but only among safe movement actions
                 for key in ("tactical", "genius", "smarter", "simple", "box_farmer", "random"):
                     a = actions[key]
                     if a in safe_acts:
