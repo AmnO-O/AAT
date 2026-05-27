@@ -71,6 +71,7 @@ BOARD_SIZE = 13
 INPUT_CHANNELS = 24
 NUM_ACTIONS = 6
 MAX_STEPS = 500
+EXPLOSION_TIME_HORIZON = 8.0  # safe tiles stay at 1.0; lower values mean earlier explosions
 
 INITIAL_GAMES = 800
 DAGGER_ROUNDS = 2
@@ -174,22 +175,88 @@ def blast_tiles(grid: np.ndarray, bx: int, by: int, radius: int) -> set:
     return tiles
 
 
+
+def bomb_effective_explosion_times(grid: np.ndarray, players: np.ndarray, bombs: np.ndarray) -> np.ndarray:
+    """
+    Resolve chain reactions and return the effective explosion timer for each bomb.
+    If bomb A explodes earlier and its blast reaches bomb B, then B inherits A's
+    earlier explosion time.
+    """
+    if bombs is None or len(bombs) == 0:
+        return np.zeros((0,), dtype=np.int32)
+
+    n = len(bombs)
+    times = np.array([max(0, int(b[2])) for b in bombs], dtype=np.int32)
+    blasts: List[set] = []
+    for i in range(n):
+        owner = int(bombs[i][3]) if bombs.shape[1] > 3 else -1
+        radius = bomb_radius_for_owner(players, owner)
+        blasts.append(blast_tiles(grid, int(bombs[i][0]), int(bombs[i][1]), radius))
+
+    q = deque(range(n))
+    in_queue = [True] * n
+    while q:
+        i = q.popleft()
+        in_queue[i] = False
+        ti = int(times[i])
+        if ti < 0:
+            ti = 0
+        for j in range(n):
+            if i == j:
+                continue
+            bj = (int(bombs[j][0]), int(bombs[j][1]))
+            if bj in blasts[i] and int(times[j]) > ti:
+                times[j] = ti
+                if not in_queue[j]:
+                    q.append(j)
+                    in_queue[j] = True
+    return times
+
+
+def explosion_time_plane(
+    grid: np.ndarray,
+    players: np.ndarray,
+    bombs: np.ndarray,
+    horizon: float = EXPLOSION_TIME_HORIZON,
+) -> np.ndarray:
+    """
+    Per-tile earliest explosion time plane.
+
+    Encoding:
+      - safe tiles: 1.0
+      - threatened tiles: min(explosion_time, horizon) / horizon
+        so smaller means sooner and safe remains the largest value.
+    """
+    plane = np.ones((BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
+    if bombs is None or len(bombs) == 0:
+        return plane
+
+    times = bomb_effective_explosion_times(grid, players, bombs)
+    for i in range(len(bombs)):
+        owner = int(bombs[i][3]) if bombs.shape[1] > 3 else -1
+        radius = bomb_radius_for_owner(players, owner)
+        t = float(max(0, int(times[i])))
+        norm_t = min(t, horizon) / horizon if horizon > 0 else 0.0
+        for r, c in blast_tiles(grid, int(bombs[i][0]), int(bombs[i][1]), radius):
+            if norm_t < plane[r, c]:
+                plane[r, c] = norm_t
+    return plane
+
+
 def danger_plane(grid: np.ndarray, players: np.ndarray, bombs: np.ndarray, timer_threshold: int = 1) -> np.ndarray:
     """
-    Approximate immediate danger map: tiles that will explode by current/next step
-    depending on timer_threshold. This is intentionally fast and conservative.
+    Binary danger plane derived from the chain-reaction-aware explosion times.
     """
     danger = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
     if bombs is None or len(bombs) == 0:
         return danger
-    for b in bombs:
-        bx, by, timer = int(b[0]), int(b[1]), int(b[2])
-        owner = int(b[3]) if len(b) > 3 else -1
-        radius = bomb_radius_for_owner(players, owner)
-        if timer <= timer_threshold:
-            for r, c in blast_tiles(grid, bx, by, radius):
-                danger[r, c] = 1.0
+
+    plane = explosion_time_plane(grid, players, bombs)
+    threshold = float(timer_threshold) / float(EXPLOSION_TIME_HORIZON) if EXPLOSION_TIME_HORIZON > 0 else 0.0
+    danger[plane <= threshold] = 1.0
     return danger
+
+
 
 
 def immediate_blast_tiles_if_placed(grid: np.ndarray, pos: Tuple[int, int], radius: int) -> set:
@@ -323,7 +390,7 @@ def encode_obs(grid: np.ndarray, players: np.ndarray, bombs: np.ndarray, my_id: 
 
     0-4   static map: wall, box, grass, radius item, capacity item
     5-8   player positions by id
-    9     immediate danger plane
+    9     earliest explosion-time plane (chain-reaction aware)
     10    my position
     11    bombs_left normalized plane
     12    bomb timer heatmap
@@ -355,8 +422,8 @@ def encode_obs(grid: np.ndarray, players: np.ndarray, bombs: np.ndarray, my_id: 
             if in_bounds(r, c):
                 state[5 + pid, r, c] = 1.0
 
-    # Danger & bomb planes
-    state[9] = danger_plane(grid, players, bombs, timer_threshold=1)
+    # Chain-reaction-aware explosion-time plane
+    state[9] = explosion_time_plane(grid, players, bombs)
 
     me_alive = 0
     my_pos = (0, 0)
@@ -490,12 +557,12 @@ def _maybe_make(cls, agent_id: int):
 
 @dataclass
 class TeacherWeights:
-    tactical: float = 3.5
+    tactical: float = 3.0
     genius: float = 2.5
     smarter: float = 2.0
     box_farmer: float = 1.5
     simple: float = 1.0
-    random: float = 0.2
+    random: float = 0.25
 
 
 class TeacherEnsemble:
