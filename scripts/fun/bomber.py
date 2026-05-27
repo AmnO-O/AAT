@@ -485,12 +485,12 @@ def _maybe_make(cls, agent_id: int):
 
 @dataclass
 class TeacherWeights:
-    tactical: float = 3.5
+    tactical: float = 3.0
     genius: float = 2.5
     smarter: float = 2.0
     box_farmer: float = 1.5
     simple: float = 1.0
-    random: float = 0.2
+    random: float = 0.25
 
 
 class TeacherEnsemble:
@@ -1039,7 +1039,6 @@ def run_epoch(model: nn.Module, loader: DataLoader, criterion, optimizer=None):
         if batch_idx % 50 == 0:
             print(f"  batch={batch_idx}", flush=True)
 
-        print(f"  batch={batch_idx} loss={loss.item():.4f} acc={(preds == actions).float().mean().item():.4f}", flush=True)
     avg_loss = total_loss / max(1, total_count)
     acc = total_correct / max(1, total_count)
     return avg_loss, acc
