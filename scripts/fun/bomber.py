@@ -490,12 +490,12 @@ def _maybe_make(cls, agent_id: int):
 
 @dataclass
 class TeacherWeights:
-    tactical: float = 3.0
+    tactical: float = 3.5
     genius: float = 2.5
     smarter: float = 2.0
     box_farmer: float = 1.5
     simple: float = 1.0
-    random: float = 0.25
+    random: float = 0.2
 
 
 class TeacherEnsemble:
