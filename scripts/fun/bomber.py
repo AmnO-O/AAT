@@ -1,49 +1,88 @@
 
 import os
+import sys
 import json
 import math
 import random
+from collections import Counter, deque
 from dataclasses import dataclass
-from collections import deque
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-# -----------------------------------------------------------------------------
-# Optional local contest import
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Local contest imports
+# =============================================================================
+sys.path.append(os.getcwd())
+
+from engine.game import BomberEnv
+
+# Baselines are optional during local development; keep graceful fallback.
+BASELINE_IMPORT_ERRORS = []
+
 try:
-    from engine.game import BomberEnv  # type: ignore
-except Exception:  # pragma: no cover
-    BomberEnv = None  # type: ignore
+    from agent.tactical_rule_agent import TacticalRuleAgent
+except Exception as e:
+    TacticalRuleAgent = None
+    BASELINE_IMPORT_ERRORS.append(("TacticalRuleAgent", repr(e)))
 
-# -----------------------------------------------------------------------------
+try:
+    from agent.genius_rule_agent import GeniusRuleAgent
+except Exception as e:
+    GeniusRuleAgent = None
+    BASELINE_IMPORT_ERRORS.append(("GeniusRuleAgent", repr(e)))
+
+try:
+    from agent.smarter_rule_agent import SmarterRuleAgent
+except Exception as e:
+    SmarterRuleAgent = None
+    BASELINE_IMPORT_ERRORS.append(("SmarterRuleAgent", repr(e)))
+
+try:
+    from agent.box_farmer_agent import BoxFarmerAgent
+except Exception as e:
+    BoxFarmerAgent = None
+    BASELINE_IMPORT_ERRORS.append(("BoxFarmerAgent", repr(e)))
+
+try:
+    from agent.simple_rule_agent import SimpleRuleAgent
+except Exception as e:
+    SimpleRuleAgent = None
+    BASELINE_IMPORT_ERRORS.append(("SimpleRuleAgent", repr(e)))
+
+try:
+    from agent.random_agent import RandomAgent
+except Exception as e:
+    RandomAgent = None
+    BASELINE_IMPORT_ERRORS.append(("RandomAgent", repr(e)))
+
+
+# =============================================================================
 # Configuration
-# -----------------------------------------------------------------------------
-BOARD_SIZE = 13
-MAX_STEPS = 500
-NUM_ACTIONS = 6
-INPUT_CHANNELS = 24
-
-SEED = 42
+# =============================================================================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+SEED = 42
+
+BOARD_SIZE = 13
+INPUT_CHANNELS = 24
+NUM_ACTIONS = 6
+MAX_STEPS = 500
 
 INITIAL_GAMES = 800
 DAGGER_ROUNDS = 2
 DAGGER_GAMES_PER_ROUND = 200
 
-TRAIN_SPLIT_MOD = 10
+TRAIN_SPLIT_MOD = 10  # seed % 10 == 0 -> validation
 CHUNK_SIZE = 2048
 BATCH_SIZE = 128
 EPOCHS = 20
 LEARNING_RATE = 1e-3
 FINE_TUNE_LR = 3e-4
 WEIGHT_DECAY = 1e-4
-LABEL_SMOOTHING = 0.03
 PATIENCE = 5
 GRAD_CLIP_NORM = 1.0
 
@@ -53,122 +92,58 @@ MODEL_PATH = "model_bc.pth"
 BEST_MODEL_PATH = "model_bc_best.pth"
 MANIFEST_NAME = "manifest.json"
 
-PASSABLE = {0, 3, 4}
-STOP, LEFT, RIGHT, UP, DOWN, PLACE_BOMB = range(6)
-ACTION_DELTAS = {
-    LEFT: (0, -1),
-    RIGHT: (0, 1),
-    UP: (-1, 0),
-    DOWN: (1, 0),
+# Teacher settings
+USE_ENSEMBLE_TEACHER = True
+TEACHER_VOTE_MODE = "weighted"  # weighted | majority | tactical_priority
+TEACHER_RANDOM_TEMPERATURE = 0.10  # small noise in tie-breaks
+
+# Augmentation
+AUGMENT_FLIP_PROB = 1.0
+
+# =============================================================================
+# Seeding
+# =============================================================================
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+set_seed(SEED)
+if hasattr(torch, "set_float32_matmul_precision"):
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
+
+# =============================================================================
+# Board utilities
+# =============================================================================
+# Game actions:
+#   0 STOP, 1 LEFT, 2 RIGHT, 3 UP, 4 DOWN, 5 PLACE_BOMB
+MOVES = {
+    0: (0, 0),
+    1: (0, -1),   # LEFT
+    2: (0, 1),    # RIGHT
+    3: (-1, 0),   # UP
+    4: (1, 0),    # DOWN
 }
 
-DIRECTIONS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-TARGET_ITEMS = {3, 4}
 
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(SEED)
-
-
-# -----------------------------------------------------------------------------
-# Generic helpers
-# -----------------------------------------------------------------------------
-def ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
+def next_pos(pos: Tuple[int, int], action: int) -> Tuple[int, int]:
+    dr, dc = MOVES[int(action)]
+    return pos[0] + dr, pos[1] + dc
 
 
 def in_bounds(r: int, c: int) -> bool:
     return 0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE
 
 
-def transform_coord(r: int, c: int, agent_id: int) -> Tuple[int, int]:
-    agent_id = int(agent_id)
-    if agent_id == 0:
-        return r, c
-    if agent_id == 1:
-        return BOARD_SIZE - 1 - r, BOARD_SIZE - 1 - c
-    if agent_id == 2:
-        return r, BOARD_SIZE - 1 - c
-    if agent_id == 3:
-        return BOARD_SIZE - 1 - r, c
-    return r, c
-
-
-def transform_action(action: int, agent_id: int) -> int:
-    """
-    Map action between world and canonical space.
-
-    The transform is self-inverse for the four seat symmetries we use:
-    - id 0: identity
-    - id 1: rotate 180 degrees
-    - id 2: mirror horizontally
-    - id 3: mirror vertically
-    """
-    a = int(action)
-    agent_id = int(agent_id)
-    if a not in range(6):
-        return STOP
-    if agent_id == 0:
-        return a
-    if agent_id == 1:
-        return {LEFT: RIGHT, RIGHT: LEFT, UP: DOWN, DOWN: UP}.get(a, a)
-    if agent_id == 2:
-        return {LEFT: RIGHT, RIGHT: LEFT}.get(a, a)
-    if agent_id == 3:
-        return {UP: DOWN, DOWN: UP}.get(a, a)
-    return a
-
-
-def canonicalize_grid(grid: np.ndarray, agent_id: int) -> np.ndarray:
-    if agent_id == 0:
-        return np.array(grid, copy=True)
-    if agent_id == 1:
-        return np.flipud(np.fliplr(grid)).copy()
-    if agent_id == 2:
-        return np.fliplr(grid).copy()
-    if agent_id == 3:
-        return np.flipud(grid).copy()
-    return np.array(grid, copy=True)
-
-
-def canonicalize_players(players: np.ndarray, agent_id: int) -> np.ndarray:
-    out = np.array(players, copy=True)
-    for i in range(len(out)):
-        r, c = int(out[i][0]), int(out[i][1])
-        nr, nc = transform_coord(r, c, agent_id)
-        out[i][0] = nr
-        out[i][1] = nc
-    return out
-
-
-def canonicalize_bombs(bombs: np.ndarray, agent_id: int) -> np.ndarray:
-    if bombs is None or len(bombs) == 0:
-        return np.zeros((0, 4), dtype=np.int8)
-    out = np.array(bombs, copy=True)
-    for i in range(len(out)):
-        r, c = int(out[i][0]), int(out[i][1])
-        nr, nc = transform_coord(r, c, agent_id)
-        out[i][0] = nr
-        out[i][1] = nc
-    return out
-
-
-def canonicalize_obs(obs: Dict, agent_id: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    grid = canonicalize_grid(np.asarray(obs["map"]), agent_id)
-    players = canonicalize_players(np.asarray(obs["players"]), agent_id)
-    bombs = canonicalize_bombs(np.asarray(obs["bombs"]), agent_id)
-    return grid, players, bombs
-
-
 def passable(grid: np.ndarray, r: int, c: int) -> bool:
-    return in_bounds(r, c) and int(grid[r, c]) in PASSABLE
-
-
-def move_from(pos: Tuple[int, int], action: int) -> Tuple[int, int]:
-    dr, dc = ACTION_DELTAS.get(int(action), (0, 0))
-    return pos[0] + dr, pos[1] + dc
+    return in_bounds(r, c) and int(grid[r, c]) in (0, 3, 4)
 
 
 def bomb_positions_set(bombs: np.ndarray) -> set:
@@ -177,34 +152,17 @@ def bomb_positions_set(bombs: np.ndarray) -> set:
     return {(int(b[0]), int(b[1])) for b in bombs}
 
 
-def my_info(players: np.ndarray, agent_id: int) -> Tuple[bool, Tuple[int, int], int, int]:
-    if agent_id >= len(players):
-        return False, (0, 0), 0, 1
-    alive = int(players[agent_id][2]) == 1
-    pos = (int(players[agent_id][0]), int(players[agent_id][1]))
-    bombs_left = int(players[agent_id][3])
-    bomb_radius = 1 + int(players[agent_id][4])
-    return alive, pos, bombs_left, bomb_radius
-
-
-# -----------------------------------------------------------------------------
-# Bomb simulation
-# -----------------------------------------------------------------------------
-def bomb_radius_for(bombs: np.ndarray, players: np.ndarray, bomb_idx: int) -> int:
-    owner = int(bombs[bomb_idx][3]) if bombs is not None and len(bombs) > bomb_idx else -1
-    if 0 <= owner < len(players):
-        # Contest observations do not expose per-bomb radius, so we approximate
-        # using the owner's current radius bonus.
-        return max(1, 1 + int(players[owner][4]))
+def bomb_radius_for_owner(players: np.ndarray, owner: int) -> int:
+    if 0 <= owner < len(players) and int(players[owner][2]) == 1:
+        return 1 + int(players[owner][4])
     return 1
 
 
-def blast_tiles(grid: np.ndarray, center: Tuple[int, int], radius: int) -> set:
-    r0, c0 = center
-    tiles = {(r0, c0)}
-    for dr, dc in DIRECTIONS:
+def blast_tiles(grid: np.ndarray, bx: int, by: int, radius: int) -> set:
+    tiles = {(bx, by)}
+    for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
         for d in range(1, radius + 1):
-            r, c = r0 + dr * d, c0 + dc * d
+            r, c = bx + dr * d, by + dc * d
             if not in_bounds(r, c):
                 break
             cell = int(grid[r, c])
@@ -216,495 +174,429 @@ def blast_tiles(grid: np.ndarray, center: Tuple[int, int], radius: int) -> set:
     return tiles
 
 
-def bomb_explosion_times(grid: np.ndarray, players: np.ndarray, bombs: np.ndarray) -> np.ndarray:
+def danger_plane(grid: np.ndarray, players: np.ndarray, bombs: np.ndarray, timer_threshold: int = 1) -> np.ndarray:
     """
-    Exact-ish chain reaction closure under the contest rules:
-    bombs in the blast path of an earlier explosion detonate immediately
-    in the same step, so we relax explosion times until a fixpoint.
+    Approximate immediate danger map: tiles that will explode by current/next step
+    depending on timer_threshold. This is intentionally fast and conservative.
     """
-    n = 0 if bombs is None else len(bombs)
-    if n == 0:
-        return np.zeros((0,), dtype=np.int32)
-
-    base = np.array([max(0, int(b[2])) for b in bombs], dtype=np.int32)
-    times = base.copy()
-
-    blasts: List[set] = []
-    for i in range(n):
-        radius = bomb_radius_for(bombs, players, i)
-        blasts.append(blast_tiles(grid, (int(bombs[i][0]), int(bombs[i][1])), radius))
-
-    changed = True
-    while changed:
-        changed = False
-        for i in range(n):
-            ti = int(times[i])
-            for j in range(n):
-                if i == j:
-                    continue
-                if (int(bombs[j][0]), int(bombs[j][1])) in blasts[i] and times[j] > ti:
-                    times[j] = ti
-                    changed = True
-    return times
-
-
-def danger_map(grid: np.ndarray, players: np.ndarray, bombs: np.ndarray, horizon: int = 1) -> np.ndarray:
     danger = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
     if bombs is None or len(bombs) == 0:
         return danger
-    times = bomb_explosion_times(grid, players, bombs)
-    for i in range(len(bombs)):
-        if int(times[i]) <= int(horizon):
-            radius = bomb_radius_for(bombs, players, i)
-            for r, c in blast_tiles(grid, (int(bombs[i][0]), int(bombs[i][1])), radius):
+    for b in bombs:
+        bx, by, timer = int(b[0]), int(b[1]), int(b[2])
+        owner = int(b[3]) if len(b) > 3 else -1
+        radius = bomb_radius_for_owner(players, owner)
+        if timer <= timer_threshold:
+            for r, c in blast_tiles(grid, bx, by, radius):
                 danger[r, c] = 1.0
     return danger
 
 
-# -----------------------------------------------------------------------------
-# Pathfinding / tactical metrics
-# -----------------------------------------------------------------------------
-def bfs_distance_map(grid: np.ndarray, start: Tuple[int, int], bombs: np.ndarray, max_depth: int = 64) -> np.ndarray:
-    dist = np.full((BOARD_SIZE, BOARD_SIZE), -1, dtype=np.int16)
-    blocked = bomb_positions_set(bombs)
-    if start in blocked:
-        blocked = set(blocked)
-        blocked.discard(start)
-
-    q = deque([(start[0], start[1])])
-    dist[start[0], start[1]] = 0
-
-    while q:
-        r, c = q.popleft()
-        d = int(dist[r, c])
-        if d >= max_depth:
-            continue
-        nd = d + 1
-        for dr, dc in DIRECTIONS:
-            nr, nc = r + dr, c + dc
-            if not passable(grid, nr, nc):
-                continue
-            if (nr, nc) in blocked:
-                continue
-            if dist[nr, nc] != -1:
-                continue
-            dist[nr, nc] = nd
-            q.append((nr, nc))
-    return dist
+def immediate_blast_tiles_if_placed(grid: np.ndarray, pos: Tuple[int, int], radius: int) -> set:
+    return blast_tiles(grid, pos[0], pos[1], radius)
 
 
-def local_degree_map(grid: np.ndarray, bombs: np.ndarray) -> np.ndarray:
-    blocked = bomb_positions_set(bombs)
-    deg = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
-    for r in range(BOARD_SIZE):
-        for c in range(BOARD_SIZE):
-            if not passable(grid, r, c) or (r, c) in blocked:
-                continue
-            cnt = 0
-            for dr, dc in DIRECTIONS:
-                nr, nc = r + dr, c + dc
-                if passable(grid, nr, nc) and (nr, nc) not in blocked:
-                    cnt += 1
-            deg[r, c] = cnt / 4.0
-    return deg
-
-
-def local_box_density(grid: np.ndarray, radius: int = 2) -> np.ndarray:
-    boxes = (grid == 2).astype(np.float32)
-    out = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
-    for r in range(BOARD_SIZE):
-        r0 = max(0, r - radius)
-        r1 = min(BOARD_SIZE, r + radius + 1)
-        for c in range(BOARD_SIZE):
-            c0 = max(0, c - radius)
-            c1 = min(BOARD_SIZE, c + radius + 1)
-            out[r, c] = float(boxes[r0:r1, c0:c1].sum()) / float((r1 - r0) * (c1 - c0))
-    return out
-
-
-def enemy_trap_potential(grid: np.ndarray, players: np.ndarray, agent_id: int, bombs: np.ndarray) -> np.ndarray:
-    out = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
-    blocked = bomb_positions_set(bombs)
-    for pid in range(len(players)):
-        if pid == agent_id or int(players[pid][2]) != 1:
-            continue
-        r, c = int(players[pid][0]), int(players[pid][1])
-        if not in_bounds(r, c):
-            continue
-        if (r, c) in blocked or not passable(grid, r, c):
-            continue
-        free_n = 0
-        for dr, dc in DIRECTIONS:
-            nr, nc = r + dr, c + dc
-            if passable(grid, nr, nc) and (nr, nc) not in blocked:
-                free_n += 1
-        trap = 1.0 - float(free_n) / 4.0
-        out[r, c] = max(out[r, c], trap)
-    return out
-
-
-def norm_distance_map(dist: np.ndarray, cap: int = 24) -> np.ndarray:
-    out = np.ones((BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
-    mask = dist >= 0
-    out[mask] = np.minimum(dist[mask], cap).astype(np.float32) / float(cap)
-    return out
-
-
-def build_safe_reachability(grid: np.ndarray, players: np.ndarray, bombs: np.ndarray, start: Tuple[int, int]) -> np.ndarray:
-    danger = danger_map(grid, players, bombs, horizon=1)
-    dist = bfs_distance_map(grid, start, bombs, max_depth=16)
-    reachable = ((dist >= 0) & (danger == 0.0)).astype(np.float32)
-    return reachable
-
-
-def can_escape_after_bomb(grid: np.ndarray, players: np.ndarray, bombs: np.ndarray, pos: Tuple[int, int], bomb_radius: int) -> bool:
-    """
-    Conservative escape check: assume the current tile becomes dangerous after
-    placing the bomb, then look for any safe reachable tile within 6 steps.
-    """
-    future = danger_map(grid, players, bombs, horizon=1)
-    bomb_tiles = blast_tiles(grid, pos, bomb_radius)
-    # Treat the hypothetical bomb blast as unsafe.
-    unsafe = set(bomb_tiles)
-    blocked = bomb_positions_set(bombs)
-    q = deque([(pos[0], pos[1], 0)])
-    seen = {pos}
-    while q:
-        r, c, d = q.popleft()
-        if d > 0 and (future[r, c] == 0.0) and ((r, c) not in unsafe):
-            return True
-        if d >= 6:
-            continue
-        for dr, dc in DIRECTIONS:
-            nr, nc = r + dr, c + dc
-            if (nr, nc) in seen:
-                continue
-            if not passable(grid, nr, nc):
-                continue
-            if (nr, nc) in blocked:
-                continue
-            seen.add((nr, nc))
-            q.append((nr, nc, d + 1))
-    return False
-
-
-def count_boxes_in_blast(grid: np.ndarray, pos: Tuple[int, int], radius: int) -> int:
-    return sum(1 for r, c in blast_tiles(grid, pos, radius) if int(grid[r, c]) == 2)
-
-
-def can_hit_enemy_with_bomb(grid: np.ndarray, players: np.ndarray, agent_id: int, pos: Tuple[int, int], radius: int) -> bool:
-    r0, c0 = pos
-    for pid in range(len(players)):
-        if pid == agent_id or int(players[pid][2]) != 1:
-            continue
-        r, c = int(players[pid][0]), int(players[pid][1])
-        if r == r0:
-            step = 1 if c > c0 else -1
-            clear = True
-            for cc in range(c0 + step, c, step):
-                if int(grid[r0, cc]) in (1, 2):
-                    clear = False
-                    break
-            if clear and abs(c - c0) <= radius:
-                return True
-        if c == c0:
-            step = 1 if r > r0 else -1
-            clear = True
-            for rr in range(r0 + step, r, step):
-                if int(grid[rr, c0]) in (1, 2):
-                    clear = False
-                    break
-            if clear and abs(r - r0) <= radius:
-                return True
-    return False
-
-
-# -----------------------------------------------------------------------------
-# Observation encoding
-# -----------------------------------------------------------------------------
-def encode_features(grid: np.ndarray, players: np.ndarray, bombs: np.ndarray, agent_id: int, step: int) -> np.ndarray:
-    """
-    24 planes on a canonical board:
-      0 walls
-      1 boxes
-      2 grass
-      3 radius items
-      4 capacity items
-      5 my position
-      6 all enemies
-      7 nearest enemy
-      8 all bombs
-      9 my bombs
-      10 enemy bombs
-      11 bomb timer heat
-      12 immediate danger
-      13 future danger
-      14 reachable safe area
-      15 safe-to-bomb plane
-      16 dead-end / low-degree plane
-      17 item distance
-      18 enemy distance
-      19 local box density
-      20 enemy trap potential
-      21 bombs left norm
-      22 bomb radius norm
-      23 phase ratio
-    """
-    canon_grid, canon_players, canon_bombs = canonicalize_obs({"map": grid, "players": players, "bombs": bombs}, agent_id)
-    state = np.zeros((INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
-
-    # Static map
-    state[0] = (canon_grid == 1).astype(np.float32)
-    state[1] = (canon_grid == 2).astype(np.float32)
-    state[2] = (canon_grid == 0).astype(np.float32)
-    state[3] = (canon_grid == 3).astype(np.float32)
-    state[4] = (canon_grid == 4).astype(np.float32)
-
-    alive, my_pos, bombs_left, bomb_radius = my_info(canon_players, agent_id)
-
-    # Players
-    if alive and in_bounds(*my_pos):
-        state[5, my_pos[0], my_pos[1]] = 1.0
-
-    enemy_positions = []
-    for pid in range(len(canon_players)):
-        if pid == agent_id or int(canon_players[pid][2]) != 1:
-            continue
-        r, c = int(canon_players[pid][0]), int(canon_players[pid][1])
-        if in_bounds(r, c):
-            state[6, r, c] = 1.0
-            enemy_positions.append((r, c))
-
-    if alive and enemy_positions:
-        # nearest enemy in canonical space
-        dist_map = bfs_distance_map(canon_grid, my_pos, canon_bombs, max_depth=64)
-        best_enemy = None
-        best_dist = 10**9
-        for ep in enemy_positions:
-            d = int(dist_map[ep[0], ep[1]])
-            if d >= 0 and d < best_dist:
-                best_dist = d
-                best_enemy = ep
-        if best_enemy is not None:
-            state[7, best_enemy[0], best_enemy[1]] = 1.0
-
-    # Bombs
-    if canon_bombs is not None and len(canon_bombs) > 0:
-        times = bomb_explosion_times(canon_grid, canon_players, canon_bombs)
-        for i in range(len(canon_bombs)):
-            r, c = int(canon_bombs[i][0]), int(canon_bombs[i][1])
-            if not in_bounds(r, c):
-                continue
-            owner = int(canon_bombs[i][3]) if canon_bombs.shape[1] > 3 else -1
-            state[8, r, c] = 1.0
-            if owner == agent_id:
-                state[9, r, c] = 1.0
-            elif 0 <= owner < len(canon_players):
-                state[10, r, c] = 1.0
-            state[11, r, c] = 1.0 / float(max(1, int(canon_bombs[i][2]) + 1))
-    else:
-        times = np.zeros((0,), dtype=np.int32)
-
-    immediate = danger_map(canon_grid, canon_players, canon_bombs, horizon=1)
-    future = danger_map(canon_grid, canon_players, canon_bombs, horizon=3)
-    state[12] = immediate
-    state[13] = future
-
-    if alive:
-        safe_reach = build_safe_reachability(canon_grid, canon_players, canon_bombs, my_pos)
-        state[14] = safe_reach
-
-        can_bomb = 1.0 if (bombs_left > 0 and not (canon_bombs is not None and (my_pos in bomb_positions_set(canon_bombs))) and can_escape_after_bomb(canon_grid, canon_players, canon_bombs, my_pos, bomb_radius)) else 0.0
-        state[15, my_pos[0], my_pos[1]] = can_bomb
-
-        deg = local_degree_map(canon_grid, canon_bombs)
-        state[16] = (deg <= 0.25).astype(np.float32)
-
-        dist_item = bfs_distance_map(canon_grid, my_pos, canon_bombs, max_depth=64)
-        item_targets = [(int(r), int(c)) for r, c in np.argwhere((canon_grid == 3) | (canon_grid == 4))]
-        enemy_targets = enemy_positions
-
-        if item_targets:
-            best = min((int(dist_item[r, c]) for r, c in item_targets if int(dist_item[r, c]) >= 0), default=-1)
-        else:
-            best = -1
-        state[17] = norm_distance_map(np.full((BOARD_SIZE, BOARD_SIZE), best, dtype=np.int16), cap=24)
-
-        if enemy_targets:
-            best_e = min((int(dist_item[r, c]) for r, c in enemy_targets if int(dist_item[r, c]) >= 0), default=-1)
-        else:
-            best_e = -1
-        state[18] = norm_distance_map(np.full((BOARD_SIZE, BOARD_SIZE), best_e, dtype=np.int16), cap=24)
-
-        state[19] = local_box_density(canon_grid, radius=2)
-        state[20] = enemy_trap_potential(canon_grid, canon_players, agent_id, canon_bombs)
-    else:
-        state[14] = 0.0
-        state[16] = 0.0
-        state[17] = 1.0
-        state[18] = 1.0
-
-    state[21] = float(bombs_left) / 5.0
-    state[22] = float(bomb_radius) / 6.0
-    state[23] = float(step) / float(MAX_STEPS)
-
-    return state
-
-
-# -----------------------------------------------------------------------------
-# Heuristic teachers / opponents
-# -----------------------------------------------------------------------------
-@dataclass(frozen=True)
-class PolicyProfile:
-    name: str
-    danger_margin: float = 1.0
-    box_bonus: float = 1.0
-    enemy_bonus: float = 1.0
-    bomb_aggression: float = 1.0
-    item_bias: float = 1.0
-
-
-PROFILE_POOL: List[PolicyProfile] = [
-    PolicyProfile("balanced", danger_margin=1.0, box_bonus=1.2, enemy_bonus=1.1, bomb_aggression=1.0, item_bias=1.0),
-    PolicyProfile("cautious", danger_margin=1.4, box_bonus=0.8, enemy_bonus=0.9, bomb_aggression=0.7, item_bias=1.3),
-    PolicyProfile("aggressive", danger_margin=0.8, box_bonus=1.4, enemy_bonus=1.4, bomb_aggression=1.4, item_bias=0.8),
-    PolicyProfile("farmer", danger_margin=1.0, box_bonus=1.6, enemy_bonus=0.8, bomb_aggression=1.1, item_bias=0.8),
-]
-
-
-class HeuristicAgent:
-    def __init__(self, agent_id: int, profile: PolicyProfile = PROFILE_POOL[0], rng: Optional[random.Random] = None):
-        self.agent_id = int(agent_id)
-        self.profile = profile
-        self.rng = rng or random.Random(0)
-
-    def act(self, obs: Dict) -> int:
-        try:
-            grid, players, bombs = canonicalize_obs(obs, self.agent_id)
-            alive, pos, bombs_left, bomb_radius = my_info(players, self.agent_id)
-            if not alive:
-                return STOP
-
-            danger_now = danger_map(grid, players, bombs, horizon=1)
-            blocked = bomb_positions_set(bombs)
-
-            if danger_now[pos[0], pos[1]] > 0.0:
-                escape = self._escape_action(grid, players, bombs, pos)
-                if escape is not None:
-                    return transform_action(escape, self.agent_id)
-
-            legal = self._legal_actions(grid, bombs, pos, bombs_left)
-            scores = {a: -1e9 for a in legal}
-            if STOP in scores:
-                scores[STOP] = -0.15
-
-            dist_map = bfs_distance_map(grid, pos, bombs, max_depth=64)
-            item_targets = [(int(r), int(c)) for r, c in np.argwhere((grid == 3) | (grid == 4))]
-            enemy_targets = [(int(players[pid][0]), int(players[pid][1])) for pid in range(len(players)) if pid != self.agent_id and int(players[pid][2]) == 1]
-
-            # Prefer movement that improves access to items or enemies.
-            for a in [LEFT, RIGHT, UP, DOWN]:
-                if a not in legal:
-                    continue
-                nxt = move_from(pos, a)
-                if danger_now[nxt[0], nxt[1]] > 0.0:
-                    scores[a] = -5.0
-                    continue
-                base = 0.0
-                if item_targets:
-                    cur = min((int(dist_map[r, c]) for r, c in item_targets if int(dist_map[r, c]) >= 0), default=999)
-                    nd_map = bfs_distance_map(grid, nxt, bombs, max_depth=64)
-                    nxt_best = min((int(nd_map[r, c]) for r, c in item_targets if int(nd_map[r, c]) >= 0), default=999)
-                    if nxt_best < cur:
-                        base += self.profile.item_bias * (cur - nxt_best + 1) * 0.12
-                if enemy_targets:
-                    cur_e = min((int(dist_map[r, c]) for r, c in enemy_targets if int(dist_map[r, c]) >= 0), default=999)
-                    nd_map = bfs_distance_map(grid, nxt, bombs, max_depth=64)
-                    nxt_e = min((int(nd_map[r, c]) for r, c in enemy_targets if int(nd_map[r, c]) >= 0), default=999)
-                    if nxt_e < cur_e:
-                        base += self.profile.enemy_bonus * (cur_e - nxt_e + 1) * 0.06
-                # Staying near open space helps surviving after bombs.
-                deg = 0
-                for dr, dc in DIRECTIONS:
-                    nr, nc = nxt[0] + dr, nxt[1] + dc
-                    if passable(grid, nr, nc) and (nr, nc) not in blocked:
-                        deg += 1
-                base += 0.03 * deg
-                scores[a] = base
-
-            if PLACE_BOMB in legal:
-                boxes = count_boxes_in_blast(grid, pos, bomb_radius)
-                enemy_hit = can_hit_enemy_with_bomb(grid, players, self.agent_id, pos, bomb_radius)
-                escape_ok = can_escape_after_bomb(grid, players, bombs, pos, bomb_radius)
-                bomb_score = 0.0
-                bomb_score += self.profile.box_bonus * boxes * 0.9
-                bomb_score += self.profile.enemy_bonus * (2.5 if enemy_hit else 0.0)
-                bomb_score += self.profile.bomb_aggression * (0.2 if escape_ok else -2.0)
-                if boxes == 0 and not enemy_hit:
-                    bomb_score -= 0.7
-                scores[PLACE_BOMB] = bomb_score
-
-            # discourage waiting in open safe positions with useful moves
-            if STOP in scores:
-                if any(scores[a] > scores[STOP] for a in [LEFT, RIGHT, UP, DOWN] if a in scores):
-                    scores[STOP] -= 0.2
-
-            # tie-break deterministically but with a tiny seeded jitter for diversity
-            best = max(scores.items(), key=lambda kv: (kv[1], self.rng.random()))[0]
-            return transform_action(best, self.agent_id)
-        except Exception:
-            return STOP
-
-    def _legal_actions(self, grid: np.ndarray, bombs: np.ndarray, pos: Tuple[int, int], bombs_left: int) -> List[int]:
-        legal = [STOP]
-        blocked = bomb_positions_set(bombs)
-        for a in [LEFT, RIGHT, UP, DOWN]:
-            nxt = move_from(pos, a)
-            if passable(grid, nxt[0], nxt[1]) and nxt not in blocked:
-                legal.append(a)
-        if bombs_left > 0 and pos not in blocked:
-            legal.append(PLACE_BOMB)
-        return legal
-
-    def _escape_action(self, grid: np.ndarray, players: np.ndarray, bombs: np.ndarray, start: Tuple[int, int]) -> Optional[int]:
-        blocked = bomb_positions_set(bombs)
-        danger = danger_map(grid, players, bombs, horizon=1)
-        q = deque([(start[0], start[1], None, 0)])
-        seen = {start}
-        while q:
-            r, c, first, dist = q.popleft()
-            if dist > 0 and danger[r, c] == 0.0:
-                return first
-            if dist >= 6:
-                continue
-            for a in [LEFT, RIGHT, UP, DOWN]:
-                nr, nc = move_from((r, c), a)
-                if (nr, nc) in seen:
-                    continue
-                if not passable(grid, nr, nc):
-                    continue
-                if (nr, nc) in blocked:
-                    continue
-                seen.add((nr, nc))
-                q.append((nr, nc, a if first is None else first, dist + 1))
+def bfs_distance_to_targets(
+    grid: np.ndarray,
+    start: Tuple[int, int],
+    targets: set,
+    bombs: np.ndarray,
+    max_depth: int = 64,
+) -> Optional[int]:
+    if not targets:
         return None
 
+    blocked = bomb_positions_set(bombs)
+    q = deque([(start, 0)])
+    seen = {start}
 
-class TeacherPolicy:
-    def __init__(self, agent_id: int, profile: Optional[PolicyProfile] = None):
+    while q:
+        pos, dist = q.popleft()
+        if pos in targets:
+            return dist
+        if dist >= max_depth:
+            continue
+        for a in (1, 2, 3, 4):
+            npos = next_pos(pos, a)
+            if npos in seen:
+                continue
+            if npos in blocked:
+                continue
+            if not passable(grid, npos[0], npos[1]):
+                continue
+            seen.add(npos)
+            q.append((npos, dist + 1))
+    return None
+
+
+def bfs_reachable_count(grid: np.ndarray, start: Tuple[int, int], bombs: np.ndarray, max_depth: int = 3) -> int:
+    blocked = bomb_positions_set(bombs)
+    q = deque([(start, 0)])
+    seen = {start}
+    count = 0
+
+    while q:
+        pos, dist = q.popleft()
+        if dist > 0:
+            count += 1
+        if dist >= max_depth:
+            continue
+        for a in (1, 2, 3, 4):
+            npos = next_pos(pos, a)
+            if npos in seen:
+                continue
+            if npos in blocked:
+                continue
+            if not passable(grid, npos[0], npos[1]):
+                continue
+            seen.add(npos)
+            q.append((npos, dist + 1))
+    return count
+
+
+def bfs_escape_available(
+    grid: np.ndarray,
+    start: Tuple[int, int],
+    players: np.ndarray,
+    bombs: np.ndarray,
+    max_depth: int = 6,
+) -> int:
+    blocked = bomb_positions_set(bombs)
+    danger = danger_plane(grid, players, bombs, timer_threshold=1)
+    q = deque([(start, 0)])
+    seen = {start}
+
+    while q:
+        pos, dist = q.popleft()
+        if dist > 0 and danger[pos[0], pos[1]] == 0.0:
+            return 1
+        if dist >= max_depth:
+            continue
+        for a in (1, 2, 3, 4):
+            npos = next_pos(pos, a)
+            if npos in seen:
+                continue
+            if npos in blocked:
+                continue
+            if not passable(grid, npos[0], npos[1]):
+                continue
+            seen.add(npos)
+            q.append((npos, dist + 1))
+    return 0
+
+
+def norm_dist(d: Optional[int], cap: float = 24.0) -> float:
+    if d is None:
+        return 1.0
+    return float(min(d, cap)) / cap
+
+
+def normalize_scalar(x: float, denom: float) -> float:
+    if denom <= 0:
+        return 0.0
+    return float(np.clip(x / denom, 0.0, 1.0))
+
+
+def legal_actions(grid: np.ndarray, bombs: np.ndarray, my_pos: Tuple[int, int], bombs_left: int) -> List[int]:
+    moves = [0]
+    blocked = bomb_positions_set(bombs)
+    for a in (1, 2, 3, 4):
+        nr, nc = next_pos(my_pos, a)
+        if passable(grid, nr, nc) and (nr, nc) not in blocked:
+            moves.append(a)
+    if bombs_left > 0 and my_pos not in blocked:
+        moves.append(5)
+    return moves
+
+
+# =============================================================================
+# Observation encoding
+# =============================================================================
+def encode_obs(grid: np.ndarray, players: np.ndarray, bombs: np.ndarray, my_id: int, step: int) -> torch.Tensor:
+    """
+    24-channel encoder, matching the README design and the updated agent.
+
+    0-4   static map: wall, box, grass, radius item, capacity item
+    5-8   player positions by id
+    9     immediate danger plane
+    10    my position
+    11    bombs_left normalized plane
+    12    bomb timer heatmap
+    13    bomb radius plane
+    14    item-distance plane (BFS normalized, scalar fill)
+    15    enemy-distance plane (BFS normalized, scalar fill)
+    16    local reachability plane (scalar fill)
+    17    escape-available plane (scalar fill)
+    18    box density around me (scalar fill)
+    19    enemy pressure (scalar fill)
+    20    bomb count normalized plane
+    21    alive flag plane
+    22    step ratio plane
+    23    spawn/phase proxy plane
+    """
+    state = np.zeros((INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
+
+    # Static map planes
+    state[0] = (grid == 1).astype(np.float32)
+    state[1] = (grid == 2).astype(np.float32)
+    state[2] = (grid == 0).astype(np.float32)
+    state[3] = (grid == 3).astype(np.float32)
+    state[4] = (grid == 4).astype(np.float32)
+
+    # Player planes by actual id
+    for pid in range(4):
+        if pid < len(players) and int(players[pid][2]) == 1:
+            r, c = int(players[pid][0]), int(players[pid][1])
+            if in_bounds(r, c):
+                state[5 + pid, r, c] = 1.0
+
+    # Danger & bomb planes
+    state[9] = danger_plane(grid, players, bombs, timer_threshold=1)
+
+    me_alive = 0
+    my_pos = (0, 0)
+    bombs_left = 0
+    bomb_radius = 1
+    if my_id < len(players) and int(players[my_id][2]) == 1:
+        me_alive = 1
+        mr, mc = int(players[my_id][0]), int(players[my_id][1])
+        my_pos = (mr, mc)
+        if in_bounds(mr, mc):
+            state[10, mr, mc] = 1.0
+        bombs_left = int(players[my_id][3])
+        bomb_radius = 1 + int(players[my_id][4])
+
+    # Global scalar planes
+    state[11].fill(normalize_scalar(bombs_left, 5.0))
+
+    if bombs is not None and len(bombs) > 0:
+        for b in bombs:
+            r, c, timer = int(b[0]), int(b[1]), int(b[2])
+            if in_bounds(r, c):
+                state[12, r, c] = 1.0 / float(max(timer, 1))
+                owner = int(b[3]) if len(b) > 3 else -1
+                state[13, r, c] = normalize_scalar(bomb_radius_for_owner(players, owner), 6.0)
+
+    state[13][state[13] == 0] = normalize_scalar(bomb_radius, 6.0)
+
+    if me_alive:
+        item_pos = {(int(r), int(c)) for r, c in np.argwhere((grid == 3) | (grid == 4))}
+        enemy_pos = {
+            (int(players[i][0]), int(players[i][1]))
+            for i in range(4)
+            if i != my_id and i < len(players) and int(players[i][2]) == 1
+        }
+        d_item = bfs_distance_to_targets(grid, my_pos, item_pos, bombs)
+        d_enemy = bfs_distance_to_targets(grid, my_pos, enemy_pos, bombs)
+
+        state[14].fill(norm_dist(d_item))
+        state[15].fill(norm_dist(d_enemy))
+        state[16].fill(normalize_scalar(bfs_reachable_count(grid, my_pos, bombs, max_depth=3), 20.0))
+        state[17].fill(float(bfs_escape_available(grid, my_pos, players, bombs, max_depth=6)))
+
+        # box density in a 5x5 neighborhood around the agent
+        r0, c0 = my_pos
+        box_cnt = 0
+        total_cnt = 0
+        for rr in range(max(0, r0 - 2), min(BOARD_SIZE, r0 + 3)):
+            for cc in range(max(0, c0 - 2), min(BOARD_SIZE, c0 + 3)):
+                total_cnt += 1
+                if int(grid[rr, cc]) == 2:
+                    box_cnt += 1
+        state[18].fill(normalize_scalar(box_cnt, float(max(total_cnt, 1))))
+
+        # enemy pressure: inverse distance proxy
+        if d_enemy is None:
+            state[19].fill(0.0)
+        else:
+            state[19].fill(1.0 - norm_dist(d_enemy))
+
+    else:
+        state[14].fill(1.0)
+        state[15].fill(1.0)
+        state[16].fill(0.0)
+        state[17].fill(0.0)
+        state[18].fill(0.0)
+        state[19].fill(0.0)
+
+    state[20].fill(normalize_scalar(len(bombs) if bombs is not None else 0, 10.0))
+    state[21].fill(float(me_alive))
+    state[22].fill(normalize_scalar(step, float(MAX_STEPS)))
+    state[23].fill(1.0 - normalize_scalar(step, float(MAX_STEPS)))  # phase proxy: early -> 1, late -> 0
+
+    return torch.from_numpy(state)
+
+
+# =============================================================================
+# Teacher ensemble
+# =============================================================================
+class _FallbackRuleAgent:
+    """
+    Tiny local fallback if baseline imports are unavailable.
+    Not intended to be strong, only to keep the trainer runnable.
+    """
+    def __init__(self, agent_id: int):
         self.agent_id = int(agent_id)
-        self.profile = profile or random.choice(PROFILE_POOL)
-        self.bot = HeuristicAgent(agent_id, profile=self.profile, rng=random.Random(SEED + agent_id * 997 + hash(self.profile.name) % 10000))
 
     def act(self, obs: Dict) -> int:
-        return int(self.bot.act(obs))
+        grid = obs["map"]
+        players = obs["players"]
+        bombs = obs["bombs"]
+        if self.agent_id >= len(players) or int(players[self.agent_id][2]) != 1:
+            return 0
+        r, c = int(players[self.agent_id][0]), int(players[self.agent_id][1])
+        bombs_left = int(players[self.agent_id][3])
+
+        danger = danger_plane(grid, players, bombs, timer_threshold=1)
+        if danger[r, c] > 0:
+            moves = []
+            for a in (1, 2, 3, 4):
+                nr, nc = next_pos((r, c), a)
+                if passable(grid, nr, nc) and danger[nr, nc] == 0 and (nr, nc) not in bomb_positions_set(bombs):
+                    moves.append(a)
+            if moves:
+                return int(random.choice(moves))
+            return 0
+
+        items = {(int(x), int(y)) for x, y in np.argwhere((grid == 3) | (grid == 4))}
+        if items:
+            best = 0
+            best_d = 10**9
+            for a in (1, 2, 3, 4):
+                nr, nc = next_pos((r, c), a)
+                if passable(grid, nr, nc) and (nr, nc) not in bomb_positions_set(bombs):
+                    d = min(abs(nr - ir) + abs(nc - ic) for ir, ic in items)
+                    if d < best_d:
+                        best_d = d
+                        best = a
+            if best != 0:
+                return int(best)
+
+        if bombs_left > 0:
+            return 5
+        return 0
 
 
-# -----------------------------------------------------------------------------
+def _maybe_make(cls, agent_id: int):
+    if cls is None:
+        return _FallbackRuleAgent(agent_id)
+    return cls(agent_id)
+
+
+@dataclass
+class TeacherWeights:
+    tactical: float = 3.5
+    genius: float = 2.5
+    smarter: float = 2.0
+    box_farmer: float = 1.5
+    simple: float = 1.0
+    random: float = 0.2
+
+
+class TeacherEnsemble:
+    def __init__(self, agent_id: int):
+        self.agent_id = int(agent_id)
+        self.tactical = _maybe_make(TacticalRuleAgent, agent_id)
+        self.genius = _maybe_make(GeniusRuleAgent, agent_id)
+        self.smarter = _maybe_make(SmarterRuleAgent, agent_id)
+        self.box_farmer = _maybe_make(BoxFarmerAgent, agent_id)
+        self.simple = _maybe_make(SimpleRuleAgent, agent_id)
+        self.random = _maybe_make(RandomAgent, agent_id)
+        self.weights = TeacherWeights()
+
+    def _collect_actions(self, obs: Dict) -> Dict[str, int]:
+        actions = {
+            "tactical": int(self.tactical.act(obs)),
+            "genius": int(self.genius.act(obs)),
+            "smarter": int(self.smarter.act(obs)),
+            "box_farmer": int(self.box_farmer.act(obs)),
+            "simple": int(self.simple.act(obs)),
+            "random": int(self.random.act(obs)),
+        }
+        return actions
+
+    def _weighted_vote(self, actions: Dict[str, int], legal: Optional[set] = None) -> int:
+        weights = self.weights
+        score = Counter()
+        score[actions["tactical"]] += weights.tactical
+        score[actions["genius"]] += weights.genius
+        score[actions["smarter"]] += weights.smarter
+        score[actions["box_farmer"]] += weights.box_farmer
+        score[actions["simple"]] += weights.simple
+        score[actions["random"]] += weights.random
+
+        if legal is not None:
+            for a in list(score.keys()):
+                if a not in legal:
+                    score[a] -= 10.0
+
+        # deterministic tie-break: tactical > genius > smarter > box_farmer > simple > random
+        priority = [actions["tactical"], actions["genius"], actions["smarter"], actions["box_farmer"], actions["simple"], actions["random"]]
+        best_score = max(score.values())
+        candidates = [a for a, s in score.items() if abs(s - best_score) < 1e-9]
+        for preferred in priority:
+            if preferred in candidates:
+                return int(preferred)
+        return int(candidates[0])
+
+    def act(self, obs: Dict) -> int:
+        grid = obs["map"]
+        players = obs["players"]
+        bombs = obs["bombs"]
+
+        if self.agent_id >= len(players) or int(players[self.agent_id][2]) != 1:
+            return 0
+
+        r, c = int(players[self.agent_id][0]), int(players[self.agent_id][1])
+        bombs_left = int(players[self.agent_id][3])
+        legal = set(legal_actions(grid, bombs, (r, c), bombs_left))
+
+        actions = self._collect_actions(obs)
+
+        # If immediately in danger, prefer actions that escape danger.
+        danger = danger_plane(grid, players, bombs, timer_threshold=1)
+        if danger[r, c] > 0.0:
+            safe_acts = []
+            for a in legal:
+                if a == 0:
+                    continue
+                nr, nc = next_pos((r, c), a)
+                if in_bounds(nr, nc) and danger[nr, nc] == 0.0:
+                    safe_acts.append(a)
+            if safe_acts:
+                # keep tactical priority, but only among safe actions
+                for key in ("tactical", "genius", "smarter", "simple", "box_farmer", "random"):
+                    a = actions[key]
+                    if a in safe_acts:
+                        return int(a)
+                return int(random.choice(safe_acts))
+
+        # If we are safe and boxes are plentiful, box_farmer gains slightly more weight.
+        box_count = int(np.sum(grid == 2))
+        if box_count >= 18:
+            self.weights.box_farmer = 2.2
+        else:
+            self.weights.box_farmer = 1.2
+
+        # If few enemies alive, tactical/genius are more useful than random.
+        alive_cnt = int(np.sum(players[:, 2])) if len(players) else 0
+        if alive_cnt <= 2:
+            self.weights.tactical = 3.5
+            self.weights.genius = 2.8
+            self.weights.smarter = 2.0
+        else:
+            self.weights.tactical = 3.0
+            self.weights.genius = 2.5
+            self.weights.smarter = 2.0
+
+        return self._weighted_vote(actions, legal=legal)
+
+
+# =============================================================================
 # Model
-# -----------------------------------------------------------------------------
+# =============================================================================
 class ResidualBlock(nn.Module):
-    def __init__(self, channels: int, dropout: float = 0.04):
+    def __init__(self, channels: int, dropout: float = 0.05):
         super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(channels)
@@ -713,17 +605,20 @@ class ResidualBlock(nn.Module):
         self.drop = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.conv1(x)
-        y = self.bn1(y)
-        y = torch.relu(y)
-        y = self.drop(y)
-        y = self.conv2(y)
-        y = self.bn2(y)
-        return torch.relu(x + y)
+        identity = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = torch.relu(out)
+        out = self.drop(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = out + identity
+        out = torch.relu(out)
+        return out
 
 
 class BomberNet(nn.Module):
-    def __init__(self, input_channels: int = INPUT_CHANNELS, num_actions: int = NUM_ACTIONS, width: int = 48, blocks: int = 4):
+    def __init__(self, input_channels: int = INPUT_CHANNELS, num_actions: int = NUM_ACTIONS, width: int = 64):
         super().__init__()
         self.stem = nn.Sequential(
             nn.Conv2d(input_channels, width, kernel_size=3, padding=1, bias=False),
@@ -733,7 +628,11 @@ class BomberNet(nn.Module):
             nn.BatchNorm2d(width),
             nn.ReLU(inplace=True),
         )
-        self.body = nn.Sequential(*[ResidualBlock(width) for _ in range(blocks)])
+        self.blocks = nn.Sequential(
+            ResidualBlock(width, dropout=0.05),
+            ResidualBlock(width, dropout=0.05),
+            ResidualBlock(width, dropout=0.05),
+        )
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.head = nn.Sequential(
             nn.Flatten(),
@@ -748,14 +647,48 @@ class BomberNet(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem(x)
-        x = self.body(x)
+        x = self.blocks(x)
         x = self.pool(x)
         return self.head(x)
 
 
-# -----------------------------------------------------------------------------
-# Chunked dataset
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Augmentation
+# =============================================================================
+def remap_action_horizontal(action: int) -> int:
+    # Mirror across vertical axis: LEFT <-> RIGHT
+    return {1: 2, 2: 1, 3: 3, 4: 4, 0: 0, 5: 5}.get(int(action), int(action))
+
+
+def remap_action_vertical(action: int) -> int:
+    # Mirror across horizontal axis: UP <-> DOWN
+    return {3: 4, 4: 3, 1: 1, 2: 2, 0: 0, 5: 5}.get(int(action), int(action))
+
+
+def augment_tensor_and_action(state: torch.Tensor, action: int) -> Tuple[torch.Tensor, int]:
+    if random.random() > AUGMENT_FLIP_PROB:
+        return state, int(action)
+
+    p = random.random()
+    if p < 0.33:
+        state = torch.flip(state, dims=[2])  # horizontal flip
+        action = remap_action_horizontal(action)
+    elif p < 0.66:
+        state = torch.flip(state, dims=[1])  # vertical flip
+        action = remap_action_vertical(action)
+    else:
+        state = torch.flip(state, dims=[1, 2])  # 180 degree
+        action = remap_action_vertical(remap_action_horizontal(action))
+    return state, int(action)
+
+
+# =============================================================================
+# Chunk helpers
+# =============================================================================
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
 def manifest_path(chunk_dir: str) -> str:
     return os.path.join(chunk_dir, MANIFEST_NAME)
 
@@ -776,14 +709,15 @@ def save_manifest(chunk_dir: str, manifest: Dict) -> None:
 def flush_chunk(chunk_dir: str, chunk_idx: int, states: List[np.ndarray], actions: List[int], seeds: List[int]) -> Dict:
     if not states:
         return {}
-    states_np = np.stack(states, axis=0).astype(np.float16)
-    actions_np = np.asarray(actions, dtype=np.int64)
-    seeds_np = np.asarray(seeds, dtype=np.int64)
+    states_np = np.stack(states, axis=0).astype(np.float32)
+    actions_np = np.array(actions, dtype=np.int64)
+    seeds_np = np.array(seeds, dtype=np.int64)
     hist = np.bincount(actions_np, minlength=NUM_ACTIONS).astype(int).tolist()
 
     filename = f"chunk_{chunk_idx:05d}.npz"
-    path = os.path.join(chunk_dir, filename)
-    np.savez_compressed(path, states=states_np, actions=actions_np, seeds=seeds_np)
+    file_path = os.path.join(chunk_dir, filename)
+    np.savez_compressed(file_path, states=states_np, actions=actions_np, seeds=seeds_np)
+
     return {
         "file": filename,
         "count": int(len(actions_np)),
@@ -793,6 +727,9 @@ def flush_chunk(chunk_dir: str, chunk_idx: int, states: List[np.ndarray], action
     }
 
 
+# =============================================================================
+# Dataset
+# =============================================================================
 class ChunkedBomberIterableDataset(IterableDataset):
     def __init__(self, chunk_dir: str, augment: bool, shuffle_chunks: bool, shuffle_within_chunk: bool, seed: int):
         super().__init__()
@@ -803,294 +740,271 @@ class ChunkedBomberIterableDataset(IterableDataset):
         self.seed = seed
         self.manifest = load_manifest(chunk_dir)
         self.chunks = list(self.manifest.get("chunks", []))
-        self.total_len = int(sum(int(c.get("count", 0)) for c in self.chunks))
+        self.counts = [int(c.get("count", 0)) for c in self.chunks]
+        self.total_len = int(sum(self.counts))
 
     def __len__(self) -> int:
         return self.total_len
 
     def __iter__(self):
-        worker = torch.utils.data.get_worker_info()
-        rng = np.random.default_rng(self.seed + (0 if worker is None else worker.id * 10007))
-        indices = np.arange(len(self.chunks))
-        if self.shuffle_chunks:
-            rng.shuffle(indices)
-        if worker is not None and worker.num_workers > 1:
-            indices = indices[worker.id :: worker.num_workers]
+        info = get_worker_info()
+        worker_id = 0 if info is None else info.id
+        num_workers = 1 if info is None else info.num_workers
 
-        for idx in indices:
-            meta = self.chunks[int(idx)]
-            path = os.path.join(self.chunk_dir, meta["file"])
-            data = np.load(path)
+        rng = np.random.default_rng(self.seed + worker_id * 1337)
+        chunk_indices = np.arange(len(self.chunks))
+        if self.shuffle_chunks:
+            rng.shuffle(chunk_indices)
+
+        # worker sharding
+        chunk_indices = chunk_indices[worker_id::num_workers]
+
+        for chunk_idx in chunk_indices:
+            chunk_meta = self.chunks[int(chunk_idx)]
+            file_path = os.path.join(self.chunk_dir, chunk_meta["file"])
+            data = np.load(file_path)
             states = data["states"]
             actions = data["actions"]
-            order = np.arange(len(actions))
+
+            idxs = np.arange(len(actions))
             if self.shuffle_within_chunk:
-                rng.shuffle(order)
-            for i in order:
+                rng.shuffle(idxs)
+
+            for i in idxs:
                 state = torch.from_numpy(states[int(i)]).float()
                 action = int(actions[int(i)])
                 if self.augment:
-                    state, action = augment_state_and_action(state, action, rng)
+                    state, action = augment_tensor_and_action(state, action)
                 yield state, torch.tensor(action, dtype=torch.long)
 
 
-# -----------------------------------------------------------------------------
-# Augmentation
-# -----------------------------------------------------------------------------
-def augment_state_and_action(state: torch.Tensor, action: int, rng: np.random.Generator) -> Tuple[torch.Tensor, int]:
-    p = float(rng.random())
-    if p < 0.25:
-        state = torch.flip(state, dims=[2])  # horizontal
-        action = transform_action(action, 2)
-    elif p < 0.50:
-        state = torch.flip(state, dims=[1])  # vertical
-        action = transform_action(action, 3)
-    elif p < 0.75:
-        state = torch.flip(state, dims=[1, 2])  # 180°
-        action = transform_action(transform_action(action, 2), 3)
-    # else: no-op
-    return state, int(action)
-
-
+# =============================================================================
+# Class weights
+# =============================================================================
 def compute_class_weights(chunk_dir: str) -> torch.Tensor:
     manifest = load_manifest(chunk_dir)
     total = np.zeros(NUM_ACTIONS, dtype=np.float64)
     for chunk in manifest.get("chunks", []):
         total += np.array(chunk.get("action_hist", [0] * NUM_ACTIONS), dtype=np.float64)
+
     total = np.maximum(total, 1.0)
-    w = total.sum() / total
-    w = w / w.mean()
-    w = np.clip(w, 0.5, 5.0)
-    return torch.tensor(w, dtype=torch.float32)
+    weights = total.sum() / total
+    weights = weights / weights.mean()
+    weights = np.clip(weights, 0.5, 5.0)
+    return torch.tensor(weights, dtype=torch.float32)
 
 
-# -----------------------------------------------------------------------------
-# Environment helpers
-# -----------------------------------------------------------------------------
-def make_env(seed: int):
-    if BomberEnv is None:
-        raise RuntimeError("BomberEnv is unavailable. Place this script inside the contest kit repo.")
-    try:
-        return BomberEnv(max_steps=MAX_STEPS, seed=seed)
-    except TypeError:
-        return BomberEnv(seed=seed)
-
-
-def reset_env(env):
-    out = env.reset()
-    if isinstance(out, tuple):
-        return out[0]
-    return out
-
-
-def step_env(env, actions: Sequence[int]):
-    out = env.step(list(map(int, actions)))
-    if len(out) == 4:
-        obs, terminated, truncated, _info = out
-    else:
-        obs, terminated, truncated = out[:3]
-    return obs, bool(terminated), bool(truncated)
-
-
-# -----------------------------------------------------------------------------
-# Data collection
-# -----------------------------------------------------------------------------
-def build_opponents(controlled_id: int, game_seed: int) -> Dict[int, HeuristicAgent]:
+# =============================================================================
+# Opponent setup
+# =============================================================================
+def build_opponents(controlled_id: int, game_seed: int) -> Dict[int, object]:
     rng = random.Random(game_seed)
-    ids = [pid for pid in range(4) if pid != controlled_id]
+    pool = [cls for cls in [TacticalRuleAgent, GeniusRuleAgent, SmarterRuleAgent, BoxFarmerAgent, SimpleRuleAgent, RandomAgent] if cls is not None]
+    if not pool:
+        pool = [_FallbackRuleAgent]
+
+    chosen = []
+    for _ in range(3):
+        chosen.append(rng.choice(pool))
+    other_ids = [pid for pid in range(4) if pid != controlled_id]
     opponents = {}
-    for pid in ids:
-        profile = rng.choice(PROFILE_POOL)
-        opponents[pid] = HeuristicAgent(pid, profile=profile, rng=random.Random(game_seed + pid * 1337))
+    for pid, cls in zip(other_ids, chosen):
+        opponents[pid] = cls(pid)
     return opponents
 
 
-def collect_one_game(seed: int, split: str, train_buf, val_buf, train_manifest, val_manifest, teacher_profile: PolicyProfile):
-    env = make_env(seed)
-    obs = reset_env(env)
-
-    controlled_id = random.Random(seed).randint(0, 3)
-    teacher = TeacherPolicy(controlled_id, profile=teacher_profile)
-    opponents = build_opponents(controlled_id, seed)
-
-    done = False
-    step = 0
-    while not done:
-        state = encode_features(obs["map"], obs["players"], obs["bombs"], controlled_id, step)
-        raw_action = int(teacher.act(obs))
-        canonical_action = transform_action(raw_action, controlled_id)
-
-        if split == "train":
-            train_buf["states"].append(state.astype(np.float32))
-            train_buf["actions"].append(canonical_action)
-            train_buf["seeds"].append(seed)
-        else:
-            val_buf["states"].append(state.astype(np.float32))
-            val_buf["actions"].append(canonical_action)
-            val_buf["seeds"].append(seed)
-
-        actions = [STOP, STOP, STOP, STOP]
-        actions[controlled_id] = raw_action
-        for pid, opp in opponents.items():
-            actions[pid] = int(opp.act(obs))
-
-        obs, terminated, truncated = step_env(env, actions)
-        done = terminated or truncated
-        step += 1
-
-        if split == "train" and len(train_buf["states"]) >= CHUNK_SIZE:
-            entry = flush_chunk(TRAIN_DIR, train_buf["chunk_idx"], train_buf["states"], train_buf["actions"], train_buf["seeds"])
-            if entry:
-                train_manifest["chunks"].append(entry)
-                save_manifest(TRAIN_DIR, train_manifest)
-                train_buf["chunk_idx"] += 1
-            train_buf["states"].clear()
-            train_buf["actions"].clear()
-            train_buf["seeds"].clear()
-
-        if split == "val" and len(val_buf["states"]) >= CHUNK_SIZE:
-            entry = flush_chunk(VAL_DIR, val_buf["chunk_idx"], val_buf["states"], val_buf["actions"], val_buf["seeds"])
-            if entry:
-                val_manifest["chunks"].append(entry)
-                save_manifest(VAL_DIR, val_manifest)
-                val_buf["chunk_idx"] += 1
-            val_buf["states"].clear()
-            val_buf["actions"].clear()
-            val_buf["seeds"].clear()
+# =============================================================================
+# Data collection
+# =============================================================================
+def collect_one_step(obs: Dict, teacher: TeacherEnsemble, my_id: int, step: int) -> Tuple[np.ndarray, int]:
+    state = encode_obs(obs["map"], obs["players"], obs["bombs"], my_id, step).numpy().astype(np.float32)
+    action = int(teacher.act(obs))
+    return state, action
 
 
-def collect_initial_data(num_games: int) -> None:
-    ensure_dir(TRAIN_DIR)
-    ensure_dir(VAL_DIR)
+def collect_initial_data(train_dir: str, val_dir: str, num_games: int) -> None:
+    ensure_dir(train_dir)
+    ensure_dir(val_dir)
 
-    train_manifest = load_manifest(TRAIN_DIR)
-    val_manifest = load_manifest(VAL_DIR)
+    train_manifest = load_manifest(train_dir)
+    val_manifest = load_manifest(val_dir)
+    train_chunk_idx = len(train_manifest.get("chunks", []))
+    val_chunk_idx = len(val_manifest.get("chunks", []))
 
-    train_buf = {"states": [], "actions": [], "seeds": [], "chunk_idx": len(train_manifest.get("chunks", []))}
-    val_buf = {"states": [], "actions": [], "seeds": [], "chunk_idx": len(val_manifest.get("chunks", []))}
-
-    rng = random.Random(SEED)
+    train_buf_states, train_buf_actions, train_buf_seeds = [], [], []
+    val_buf_states, val_buf_actions, val_buf_seeds = [], [], []
 
     for game_idx in range(num_games):
-        seed = SEED * 1000 + game_idx
+        seed = SEED + game_idx
+        controlled_id = game_idx % 4
         split = "val" if (seed % TRAIN_SPLIT_MOD == 0) else "train"
-        teacher_profile = rng.choice(PROFILE_POOL)
-        collect_one_game(seed, split, train_buf, val_buf, train_manifest, val_manifest, teacher_profile)
 
-        if (game_idx + 1) % 50 == 0:
-            train_count = sum(c["count"] for c in train_manifest.get("chunks", [])) + len(train_buf["actions"])
-            val_count = sum(c["count"] for c in val_manifest.get("chunks", [])) + len(val_buf["actions"])
+        env = BomberEnv(max_steps=MAX_STEPS, seed=seed)
+        obs = env.reset()
+        teacher = TeacherEnsemble(controlled_id)
+        opponents = build_opponents(controlled_id, seed)
+
+        done = False
+        step = 0
+        while not done:
+            state_np, expert_action = collect_one_step(obs, teacher, controlled_id, step)
+
+            if split == "train":
+                train_buf_states.append(state_np)
+                train_buf_actions.append(expert_action)
+                train_buf_seeds.append(seed)
+            else:
+                val_buf_states.append(state_np)
+                val_buf_actions.append(expert_action)
+                val_buf_seeds.append(seed)
+
+            actions = [0, 0, 0, 0]
+            actions[controlled_id] = expert_action
+            for pid, agent in opponents.items():
+                actions[pid] = int(agent.act(obs))
+
+            obs, terminated, truncated = env.step(actions)
+            done = bool(terminated or truncated)
+            step += 1
+
+            if split == "train" and len(train_buf_states) >= CHUNK_SIZE:
+                entry = flush_chunk(train_dir, train_chunk_idx, train_buf_states, train_buf_actions, train_buf_seeds)
+                if entry:
+                    train_manifest["chunks"].append(entry)
+                    save_manifest(train_dir, train_manifest)
+                    train_chunk_idx += 1
+                train_buf_states.clear()
+                train_buf_actions.clear()
+                train_buf_seeds.clear()
+
+            if split == "val" and len(val_buf_states) >= CHUNK_SIZE:
+                entry = flush_chunk(val_dir, val_chunk_idx, val_buf_states, val_buf_actions, val_buf_seeds)
+                if entry:
+                    val_manifest["chunks"].append(entry)
+                    save_manifest(val_dir, val_manifest)
+                    val_chunk_idx += 1
+                val_buf_states.clear()
+                val_buf_actions.clear()
+                val_buf_seeds.clear()
+
+        if (game_idx + 1) % 100 == 0:
+            train_count = sum(c["count"] for c in train_manifest.get("chunks", [])) + len(train_buf_actions)
+            val_count = sum(c["count"] for c in val_manifest.get("chunks", [])) + len(val_buf_actions)
             print(f"Collected {game_idx + 1}/{num_games} games | train={train_count} | val={val_count}", flush=True)
 
-    if train_buf["states"]:
-        entry = flush_chunk(TRAIN_DIR, train_buf["chunk_idx"], train_buf["states"], train_buf["actions"], train_buf["seeds"])
+    if train_buf_states:
+        entry = flush_chunk(train_dir, train_chunk_idx, train_buf_states, train_buf_actions, train_buf_seeds)
         if entry:
             train_manifest["chunks"].append(entry)
-    if val_buf["states"]:
-        entry = flush_chunk(VAL_DIR, val_buf["chunk_idx"], val_buf["states"], val_buf["actions"], val_buf["seeds"])
+    if val_buf_states:
+        entry = flush_chunk(val_dir, val_chunk_idx, val_buf_states, val_buf_actions, val_buf_seeds)
         if entry:
             val_manifest["chunks"].append(entry)
 
-    save_manifest(TRAIN_DIR, train_manifest)
-    save_manifest(VAL_DIR, val_manifest)
+    save_manifest(train_dir, train_manifest)
+    save_manifest(val_dir, val_manifest)
 
 
 def collect_dagger_data(model: nn.Module, out_dir: str, num_games: int) -> int:
     ensure_dir(out_dir)
     model.eval()
 
-    manifest = load_manifest(out_dir)
-    buf = {"states": [], "actions": [], "seeds": [], "chunk_idx": len(manifest.get("chunks", []))}
+    out_manifest = load_manifest(out_dir)
+    chunk_idx = len(out_manifest.get("chunks", []))
+    buf_states, buf_actions, buf_seeds = [], [], []
     collected = 0
 
-    def flush_buf():
-        nonlocal collected
-        if not buf["states"]:
+    def flush_buffer():
+        nonlocal chunk_idx, collected
+        if not buf_states:
             return
-        entry = flush_chunk(out_dir, buf["chunk_idx"], buf["states"], buf["actions"], buf["seeds"])
+        entry = flush_chunk(out_dir, chunk_idx, buf_states, buf_actions, buf_seeds)
         if entry:
-            manifest["chunks"].append(entry)
-            save_manifest(out_dir, manifest)
-            buf["chunk_idx"] += 1
+            out_manifest["chunks"].append(entry)
+            save_manifest(out_dir, out_manifest)
             collected += entry["count"]
-        buf["states"].clear()
-        buf["actions"].clear()
-        buf["seeds"].clear()
-
-    rng = random.Random(SEED + 999)
+            chunk_idx += 1
+        buf_states.clear()
+        buf_actions.clear()
+        buf_seeds.clear()
 
     for game_idx in range(num_games):
-        seed = 100000 + SEED * 1000 + game_idx
-        controlled_id = rng.randint(0, 3)
-        teacher = TeacherPolicy(controlled_id, profile=rng.choice(PROFILE_POOL))
+        seed = 100000 + SEED + game_idx
+        controlled_id = game_idx % 4
+
+        env = BomberEnv(max_steps=MAX_STEPS, seed=seed)
+        obs = env.reset()
+        teacher = TeacherEnsemble(controlled_id)
         opponents = build_opponents(controlled_id, seed)
 
-        env = make_env(seed)
-        obs = reset_env(env)
         done = False
         step = 0
-
         while not done:
-            state = encode_features(obs["map"], obs["players"], obs["bombs"], controlled_id, step)
+            state = encode_obs(obs["map"], obs["players"], obs["bombs"], controlled_id, step).unsqueeze(0).to(DEVICE)
             with torch.no_grad():
-                inp = torch.from_numpy(state).unsqueeze(0).to(DEVICE)
-                logits = model(inp)[0]
-                student_action = int(torch.argmax(logits).item())
-            teacher_action_raw = int(teacher.act(obs))
-            teacher_action = transform_action(teacher_action_raw, controlled_id)
+                logits = model(state)
+                student_action = int(torch.argmax(logits, dim=1).item())
 
-            if student_action != teacher_action:
-                buf["states"].append(state.astype(np.float32))
-                buf["actions"].append(teacher_action)
-                buf["seeds"].append(seed)
+            expert_action = int(teacher.act(obs))
 
-            actions = [STOP, STOP, STOP, STOP]
-            actions[controlled_id] = transform_action(student_action, controlled_id)
-            for pid, opp in opponents.items():
-                actions[pid] = int(opp.act(obs))
+            # collect disagreements and risky deviations
+            if student_action != expert_action or (student_action == 0 and expert_action != 0):
+                buf_states.append(state.squeeze(0).cpu().numpy().astype(np.float32))
+                buf_actions.append(expert_action)
+                buf_seeds.append(seed)
 
-            obs, terminated, truncated = step_env(env, actions)
-            done = terminated or truncated
+            actions = [0, 0, 0, 0]
+            actions[controlled_id] = student_action
+            for pid, agent in opponents.items():
+                actions[pid] = int(agent.act(obs))
+
+            obs, terminated, truncated = env.step(actions)
+            done = bool(terminated or truncated)
             step += 1
 
-            if len(buf["states"]) >= CHUNK_SIZE:
-                flush_buf()
+            if len(buf_states) >= CHUNK_SIZE:
+                flush_buffer()
 
         if (game_idx + 1) % 50 == 0:
-            print(f"DAgger {game_idx + 1}/{num_games} games | new samples={collected + len(buf['actions'])}", flush=True)
+            print(f"DAgger {game_idx + 1}/{num_games} games | new samples={collected + len(buf_actions)}", flush=True)
 
-    flush_buf()
+    flush_buffer()
     return collected
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Training
-# -----------------------------------------------------------------------------
+# =============================================================================
 def build_loaders(train_dir: str, val_dir: str):
-    train_ds = ChunkedBomberIterableDataset(train_dir, augment=True, shuffle_chunks=True, shuffle_within_chunk=True, seed=SEED)
-    val_ds = ChunkedBomberIterableDataset(val_dir, augment=False, shuffle_chunks=False, shuffle_within_chunk=False, seed=SEED)
+    train_ds = ChunkedBomberIterableDataset(
+        train_dir,
+        augment=True,
+        shuffle_chunks=True,
+        shuffle_within_chunk=True,
+        seed=SEED,
+    )
+    val_ds = ChunkedBomberIterableDataset(
+        val_dir,
+        augment=False,
+        shuffle_chunks=False,
+        shuffle_within_chunk=False,
+        seed=SEED,
+    )
 
     if len(train_ds) == 0:
         raise RuntimeError(f"No training samples found in {train_dir}")
     if len(val_ds) == 0:
         raise RuntimeError(f"No validation samples found in {val_dir}")
 
-    train_loader = DataLoader(
-        train_ds,
+    loader_kwargs = dict(
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=2,
         pin_memory=(DEVICE.type == "cuda"),
         drop_last=False,
     )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=2,
-        pin_memory=(DEVICE.type == "cuda"),
-        drop_last=False,
-    )
+    train_loader = DataLoader(train_ds, **loader_kwargs)
+    val_loader = DataLoader(val_ds, **loader_kwargs)
     class_weights = compute_class_weights(train_dir).to(DEVICE)
     return train_loader, val_loader, class_weights
 
@@ -1117,16 +1031,15 @@ def run_epoch(model: nn.Module, loader: DataLoader, criterion, optimizer=None):
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
             optimizer.step()
 
-        total_loss += float(loss.item()) * int(states.size(0))
+        total_loss += float(loss.item()) * states.size(0)
         preds = torch.argmax(logits, dim=1)
         total_correct += int((preds == actions).sum().item())
         total_count += int(states.size(0))
 
         if batch_idx % 50 == 0:
-            print(f"    batch {batch_idx}/{max(1, len(loader))}", flush=True)
-        
-        print(f"    batch {batch_idx}/{max(1, len(loader))} | loss={loss.item():.4f} | acc={int((preds == actions).sum().item()) / max(1, states.size(0)):.4f}", flush=True)
+            print(f"  batch={batch_idx}", flush=True)
 
+        print(f"  batch={batch_idx} loss={loss.item():.4f} acc={(preds == actions).float().mean().item():.4f}", flush=True)
     avg_loss = total_loss / max(1, total_count)
     acc = total_correct / max(1, total_count)
     return avg_loss, acc
@@ -1135,17 +1048,14 @@ def run_epoch(model: nn.Module, loader: DataLoader, criterion, optimizer=None):
 def train_policy_model(train_dir: str, val_dir: str, init_model_path: Optional[str] = None, lr: float = LEARNING_RATE):
     train_loader, val_loader, class_weights = build_loaders(train_dir, val_dir)
 
-    model = BomberNet().to(DEVICE)
+    model = BomberNet(INPUT_CHANNELS).to(DEVICE)
     if init_model_path and os.path.exists(init_model_path):
-        try:
-            state = torch.load(init_model_path, map_location=DEVICE)
-            model.load_state_dict(state, strict=True)
-        except Exception as e:
-            print(f"Warning: could not load init model {init_model_path}: {e}", flush=True)
+        state = torch.load(init_model_path, map_location=DEVICE)
+        model.load_state_dict(state, strict=True)
 
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
-    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=LABEL_SMOOTHING)
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.03)
 
     best_val_loss = float("inf")
     best_state = None
@@ -1158,7 +1068,8 @@ def train_policy_model(train_dir: str, val_dir: str, init_model_path: Optional[s
         scheduler.step(val_loss)
 
         print(
-            f"  train_loss={train_loss:.4f} train_acc={train_acc:.4f} | "
+            f"Epoch {epoch:02d}/{EPOCHS} | "
+            f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} | "
             f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}",
             flush=True,
         )
@@ -1182,52 +1093,66 @@ def train_policy_model(train_dir: str, val_dir: str, init_model_path: Optional[s
     return model
 
 
+# =============================================================================
+# Optional quick eval
+# =============================================================================
 def quick_eval_against_baselines(model: nn.Module, num_games: int = 20) -> None:
     model.eval()
-    stats = {"win": 0, "draw": 0, "loss": 0}
+    wins = 0
+    draws = 0
+    losses = 0
+
     for game_idx in range(num_games):
-        seed = 200000 + game_idx
+        seed = 200000 + SEED + game_idx
         controlled_id = game_idx % 4
+        env = BomberEnv(max_steps=MAX_STEPS, seed=seed)
+        obs = env.reset()
         opponents = build_opponents(controlled_id, seed)
 
-        env = make_env(seed)
-        obs = reset_env(env)
         done = False
         step = 0
         while not done:
-            state = encode_features(obs["map"], obs["players"], obs["bombs"], controlled_id, step)
             with torch.no_grad():
-                logits = model(torch.from_numpy(state).unsqueeze(0).to(DEVICE))[0]
-                action = int(torch.argmax(logits).item())
-            actions = [STOP, STOP, STOP, STOP]
-            actions[controlled_id] = transform_action(action, controlled_id)
-            for pid, opp in opponents.items():
-                actions[pid] = int(opp.act(obs))
-            obs, terminated, truncated = step_env(env, actions)
-            done = terminated or truncated
+                state = encode_obs(obs["map"], obs["players"], obs["bombs"], controlled_id, step).unsqueeze(0).to(DEVICE)
+                logits = model(state)
+                action = int(torch.argmax(logits, dim=1).item())
+
+            actions = [0, 0, 0, 0]
+            actions[controlled_id] = action
+            for pid, agent in opponents.items():
+                actions[pid] = int(agent.act(obs))
+
+            obs, terminated, truncated = env.step(actions)
+            done = bool(terminated or truncated)
             step += 1
 
-        alive = [int(p[2]) for p in np.asarray(obs["players"])]
-        my_alive = alive[controlled_id] if controlled_id < len(alive) else 0
+        alive = [int(p[2]) for p in obs["players"]]
+        my_alive = alive[controlled_id]
         alive_count = sum(alive)
         if my_alive == 1 and alive_count == 1:
-            stats["win"] += 1
+            wins += 1
         elif my_alive == 1:
-            stats["draw"] += 1
+            draws += 1
         else:
-            stats["loss"] += 1
-    print(f"Quick eval proxy: {stats}", flush=True)
+            losses += 1
+
+    print(f"Quick eval proxy | wins={wins} draws={draws} losses={losses}", flush=True)
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Main
-# -----------------------------------------------------------------------------
+# =============================================================================
 def main():
     ensure_dir(TRAIN_DIR)
     ensure_dir(VAL_DIR)
 
+    if BASELINE_IMPORT_ERRORS:
+        print("Some baseline imports failed; trainer will use fallback rules where needed.", flush=True)
+        for name, err in BASELINE_IMPORT_ERRORS:
+            print(f"  - {name}: {err}", flush=True)
+
     print("=== Phase 1: Collect initial demonstrations ===", flush=True)
-    collect_initial_data(INITIAL_GAMES)
+    collect_initial_data(TRAIN_DIR, VAL_DIR, INITIAL_GAMES)
 
     print("=== Phase 2: Train initial policy ===", flush=True)
     model = train_policy_model(TRAIN_DIR, VAL_DIR, init_model_path=None, lr=LEARNING_RATE)
@@ -1235,7 +1160,7 @@ def main():
     for round_idx in range(DAGGER_ROUNDS):
         print(f"=== Phase 3.{round_idx + 1}: DAgger collection ===", flush=True)
         new_samples = collect_dagger_data(model, TRAIN_DIR, DAGGER_GAMES_PER_ROUND)
-        print(f"DAgger round {round_idx + 1}: collected {new_samples} samples", flush=True)
+        print(f"DAgger round {round_idx + 1}: collected {new_samples} correction samples", flush=True)
 
         print(f"=== Phase 4.{round_idx + 1}: Fine-tune with aggregated data ===", flush=True)
         model = train_policy_model(TRAIN_DIR, VAL_DIR, init_model_path=MODEL_PATH, lr=FINE_TUNE_LR)
