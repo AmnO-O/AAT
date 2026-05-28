@@ -560,8 +560,8 @@ class TeacherWeights:
     tactical: float = 3.0
     genius: float = 2.5
     smarter: float = 2.0
-    box_farmer: float = 1.5
-    simple: float = 1.0
+    box_farmer: float = 1.0
+    simple: float = 0.75
     random: float = 0.25
 
 

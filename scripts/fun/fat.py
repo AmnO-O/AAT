@@ -676,8 +676,8 @@ class TeacherWeights:
     tactical: float = 3.0
     genius: float = 2.5
     smarter: float = 2.0
-    box_farmer: float = 1.5
-    simple: float = 1.0
+    box_farmer: float = 1.0
+    simple: float = 0.75
     random: float = 0.25
 
 
@@ -985,7 +985,7 @@ def compute_class_weights(chunk_dir: str) -> torch.Tensor:
 # =============================================================================
 def build_opponents(controlled_id: int, game_seed: int) -> Dict[int, object]:
     rng = random.Random(game_seed)
-    pool = [cls for cls in [TacticalRuleAgent, GeniusRuleAgent, SmarterRuleAgent, BoxFarmerAgent] if cls is not None]
+    pool = [cls for cls in [TacticalRuleAgent, GeniusRuleAgent, SmarterRuleAgent] if cls is not None]
     if not pool:
         pool = [_FallbackRuleAgent]
 
