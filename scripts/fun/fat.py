@@ -68,7 +68,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
 
 BOARD_SIZE = 13
-INPUT_CHANNELS = 24
+INPUT_CHANNELS = 27
 NUM_ACTIONS = 6
 MAX_STEPS = 500
 EXPLOSION_TIME_HORIZON = 8.0  # safe tiles stay at 1.0; lower values mean earlier explosions
@@ -315,6 +315,236 @@ def future_danger_plane(grid: np.ndarray, players: np.ndarray, bombs: np.ndarray
     return plane
 
 
+
+def tile_earliest_explosion_times(grid: np.ndarray, players: np.ndarray, bombs: np.ndarray) -> np.ndarray:
+    """
+    Exact earliest explosion time per tile after chain reactions.
+    Safe tiles are marked with a large sentinel value.
+    """
+    times = np.full((BOARD_SIZE, BOARD_SIZE), 9999, dtype=np.int32)
+    if bombs is None or len(bombs) == 0:
+        return times
+
+    eff = bomb_effective_explosion_times(grid, players, bombs)
+    for i, b in enumerate(bombs):
+        owner = int(b[3]) if bombs.shape[1] > 3 else -1
+        radius = bomb_radius_for_owner(players, owner)
+        t = int(max(0, eff[i]))
+        for r, c in blast_tiles(grid, int(b[0]), int(b[1]), radius):
+            if t < times[r, c]:
+                times[r, c] = t
+    return times
+
+
+def bomb_pressure_plane(grid: np.ndarray, players: np.ndarray, bombs: np.ndarray, my_id: int) -> np.ndarray:
+    """
+    Enemy bomb pressure from bombs that enemies can plausibly place from their
+    current positions right now.
+    """
+    plane = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
+    if bombs is None:
+        bombs = np.zeros((0, 4), dtype=np.int8)
+
+    for pid in range(4):
+        if pid == my_id or pid >= len(players):
+            continue
+        if int(players[pid][2]) != 1:
+            continue
+        bombs_left = int(players[pid][3])
+        if bombs_left <= 0:
+            continue
+
+        r, c = int(players[pid][0]), int(players[pid][1])
+        if not in_bounds(r, c):
+            continue
+
+        # Current-position bomb threat.
+        radius = 1 + int(players[pid][4])
+        for x, y in blast_tiles(grid, r, c, radius):
+            plane[x, y] = max(plane[x, y], 1.0)
+
+    return plane
+
+
+def future_bomb_pressure_plane(grid: np.ndarray, players: np.ndarray, bombs: np.ndarray, my_id: int) -> np.ndarray:
+    """
+    Approximate pressure if enemies move one step and then are able to bomb on a later step.
+    This is intentionally soft and low-cost.
+    """
+    plane = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
+    if bombs is None:
+        bombs = np.zeros((0, 4), dtype=np.int8)
+
+    blocked = bomb_positions_set(bombs)
+    for pid in range(4):
+        if pid == my_id or pid >= len(players):
+            continue
+        if int(players[pid][2]) != 1:
+            continue
+        bombs_left = int(players[pid][3])
+        if bombs_left <= 0:
+            continue
+
+        r, c = int(players[pid][0]), int(players[pid][1])
+        if not in_bounds(r, c):
+            continue
+
+        radius = 1 + int(players[pid][4])
+        # Likely next-step positions if the enemy chooses to reposition.
+        candidate_tiles = [(r, c)]
+        for a in (1, 2, 3, 4):
+            nr, nc = next_pos((r, c), a)
+            if passable(grid, nr, nc) and (nr, nc) not in blocked:
+                candidate_tiles.append((nr, nc))
+
+        for pr, pc in candidate_tiles:
+            for x, y in blast_tiles(grid, pr, pc, radius):
+                # softer weight than an immediate bomb threat
+                plane[x, y] = max(plane[x, y], 0.5)
+
+    return plane
+
+
+def bottleneck_risk_plane(grid: np.ndarray, players: np.ndarray, bombs: np.ndarray, my_id: int) -> np.ndarray:
+    """
+    High when my current position has very few safe exits and those exits are fragile.
+    """
+    plane = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
+    if my_id >= len(players) or int(players[my_id][2]) != 1:
+        return plane
+
+    my_r, my_c = int(players[my_id][0]), int(players[my_id][1])
+    blocked = bomb_positions_set(bombs)
+    explosion_times = tile_earliest_explosion_times(grid, players, bombs)
+    danger_now = danger_plane(grid, players, bombs, timer_threshold=1)
+
+    # A tile is risky if it has <= 1 safe neighboring escape and is close to an explosion.
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            if not passable(grid, r, c):
+                continue
+            if (r, c) in blocked:
+                continue
+
+            exits = 0
+            fragile = 0
+            for a in (1, 2, 3, 4):
+                nr, nc = next_pos((r, c), a)
+                if not passable(grid, nr, nc):
+                    continue
+                if (nr, nc) in blocked:
+                    continue
+                exits += 1
+                if danger_now[nr, nc] > 0.0 or explosion_times[nr, nc] <= 2:
+                    fragile += 1
+
+            if exits == 0:
+                score = 1.0
+            elif exits == 1:
+                score = 0.85 if fragile > 0 else 0.65
+            elif exits == 2:
+                score = 0.4 if fragile >= 2 else 0.2
+            else:
+                score = 0.0
+
+            # Stronger around my current position and nearby cells.
+            manhattan = abs(r - my_r) + abs(c - my_c)
+            if manhattan <= 1:
+                score = max(score, 0.75)
+            elif manhattan <= 2:
+                score = max(score, 0.35)
+
+            plane[r, c] = score
+
+    return plane
+
+
+def escape_margin_from_position(
+    grid: np.ndarray,
+    players: np.ndarray,
+    bombs: np.ndarray,
+    start: Tuple[int, int],
+    max_depth: int = 6,
+) -> float:
+    """
+    Largest positive margin between when a tile explodes and the time needed to reach it.
+    > 0 means there exists at least one tile reachable before it explodes.
+    """
+    explosion_times = tile_earliest_explosion_times(grid, players, bombs)
+    blocked = bomb_positions_set(bombs)
+
+    q = deque([(start, 0)])
+    seen = {start}
+    best_margin = -9999
+
+    while q:
+        pos, dist = q.popleft()
+        t_exp = int(explosion_times[pos[0], pos[1]])
+        margin = t_exp - dist
+        if margin > best_margin:
+            best_margin = margin
+        if dist >= max_depth:
+            continue
+        for a in (1, 2, 3, 4):
+            npos = next_pos(pos, a)
+            if npos in seen:
+                continue
+            if npos in blocked:
+                continue
+            if not passable(grid, npos[0], npos[1]):
+                continue
+            seen.add(npos)
+            q.append((npos, dist + 1))
+
+    if best_margin < -1000:
+        return -1.0
+    return float(best_margin)
+
+
+def time_safe_escape_score(grid: np.ndarray, players: np.ndarray, bombs: np.ndarray, my_id: int) -> float:
+    """
+    Normalized escape score from the agent's current position.
+    """
+    if my_id >= len(players) or int(players[my_id][2]) != 1:
+        return 0.0
+    my_pos = (int(players[my_id][0]), int(players[my_id][1]))
+    margin = escape_margin_from_position(grid, players, bombs, my_pos, max_depth=6)
+    if margin <= 0:
+        return 0.0
+    return float(np.clip(margin / 6.0, 0.0, 1.0))
+
+
+def should_place_bomb_here(grid: np.ndarray, players: np.ndarray, bombs: np.ndarray, my_id: int, pos: Tuple[int, int]) -> bool:
+    """
+    Cheap survival check for a hypothetical bomb at pos.
+    We only require at least one escape route before the bomb timer window closes.
+    """
+    if my_id >= len(players) or int(players[my_id][2]) != 1:
+        return False
+    if not passable(grid, pos[0], pos[1]):
+        return False
+
+    my_radius = 1 + int(players[my_id][4])
+    blocked = bomb_positions_set(bombs)
+
+    # Candidate blast area if I bomb this tile.
+    blast = blast_tiles(grid, pos[0], pos[1], my_radius)
+
+    # Need an exit that is not in blast, not blocked, and reachable in time.
+    for a in (1, 2, 3, 4):
+        nr, nc = next_pos(pos, a)
+        if not passable(grid, nr, nc):
+            continue
+        if (nr, nc) in blocked:
+            continue
+        if (nr, nc) in blast:
+            continue
+        if escape_margin_from_position(grid, players, bombs, (nr, nc), max_depth=6) > 0:
+            return True
+    return False
+
+
+
 def safe_to_bomb_plane(
     grid: np.ndarray,
     players: np.ndarray,
@@ -322,62 +552,53 @@ def safe_to_bomb_plane(
     my_id: int,
 ) -> np.ndarray:
     """
-    Mark tiles where placing a bomb looks tactically good and there is at least one escape route.
-    This is approximate on purpose so inference stays fast.
+    Mark my current tile if placing a bomb there looks both useful and survivable.
+    This is intentionally compact so the model sees a clear bomb-safety signal.
     """
     plane = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
     if my_id >= len(players) or int(players[my_id][2]) != 1:
         return plane
 
     my_r, my_c = int(players[my_id][0]), int(players[my_id][1])
-    bomb_radius = 1 + int(players[my_id][4])
-    blocked = bomb_positions_set(bombs)
-    imm = immediate_danger_plane(grid, players, bombs)
-    chain = chain_danger_plane(grid, players, bombs)
-    danger = np.maximum(imm, chain)
+    if not in_bounds(my_r, my_c):
+        return plane
 
+    # Must be a place where a bomb can actually be dropped.
+    blocked = bomb_positions_set(bombs)
+    if (my_r, my_c) in blocked:
+        return plane
+
+    bomb_radius = 1 + int(players[my_id][4])
+    blast = blast_tiles(grid, my_r, my_c, bomb_radius)
+
+    # Good if it is tactically meaningful.
     enemy_positions = {
         (int(players[i][0]), int(players[i][1]))
         for i in range(4)
         if i != my_id and i < len(players) and int(players[i][2]) == 1
     }
+    hit_boxes = any(int(grid[x, y]) == 2 for x, y in blast)
+    hit_enemy = any((x, y) in enemy_positions for x, y in blast)
+    if not (hit_boxes or hit_enemy):
+        return plane
 
-    for r in range(BOARD_SIZE):
-        for c in range(BOARD_SIZE):
-            if not passable(grid, r, c):
-                continue
-            if (r, c) in blocked:
-                continue
-            if danger[r, c] > 0.0:
-                continue
+    # Must have at least one escape route that remains valid before explosions happen.
+    safe_exit = False
+    for a in (1, 2, 3, 4):
+        nr, nc = next_pos((my_r, my_c), a)
+        if not passable(grid, nr, nc):
+            continue
+        if (nr, nc) in blocked:
+            continue
+        if (nr, nc) in blast:
+            continue
+        if escape_margin_from_position(grid, players, bombs, (nr, nc), max_depth=6) > 0:
+            safe_exit = True
+            break
 
-            blast = blast_tiles(grid, r, c, bomb_radius)
-
-            # Tactical value: hits boxes or enemies
-            hit_boxes = any(int(grid[x, y]) == 2 for x, y in blast)
-            hit_enemy = any((x, y) in enemy_positions for x, y in blast)
-            if not (hit_boxes or hit_enemy):
-                continue
-
-            # Need at least one adjacent safe escape tile
-            exits = 0
-            for a in (1, 2, 3, 4):
-                nr, nc = next_pos((r, c), a)
-                if not passable(grid, nr, nc):
-                    continue
-                if (nr, nc) in blocked:
-                    continue
-                if (nr, nc) in blast:
-                    continue
-                if danger[nr, nc] > 0.0:
-                    continue
-                exits += 1
-
-            if exits > 0:
-                plane[r, c] = 1.0
-
+    if safe_exit:
+        plane[my_r, my_c] = 1.0
     return plane
-
 
 
 def immediate_blast_tiles_if_placed(grid: np.ndarray, pos: Tuple[int, int], radius: int) -> set:
@@ -505,9 +726,10 @@ def movement_actions_from_legal(legal: Iterable[int]) -> List[int]:
 # =============================================================================
 # Observation encoding
 # =============================================================================
+
 def encode_obs(grid: np.ndarray, players: np.ndarray, bombs: np.ndarray, my_id: int, step: int) -> torch.Tensor:
     """
-    Updated 24-channel encoder.
+    Updated 27-channel encoder.
 
     0  wall
     1  box
@@ -518,7 +740,7 @@ def encode_obs(grid: np.ndarray, players: np.ndarray, bombs: np.ndarray, my_id: 
     6  player 1 position
     7  player 2 position
     8  player 3 position
-    9  chain-aware earliest explosion time plane
+    9  earliest explosion time plane
     10 immediate danger plane
     11 chain-reaction danger plane
     12 future danger plane
@@ -529,10 +751,13 @@ def encode_obs(grid: np.ndarray, players: np.ndarray, bombs: np.ndarray, my_id: 
     17 BFS distance to nearest item
     18 BFS distance to nearest enemy
     19 local reachability plane
-    20 escape-available plane
+    20 time-aware escape score plane
     21 safe-to-bomb plane
     22 bomb count normalized plane
     23 step ratio plane
+    24 enemy current bomb pressure
+    25 enemy future bomb pressure
+    26 bottleneck risk
     """
     state = np.zeros((INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
 
@@ -560,7 +785,6 @@ def encode_obs(grid: np.ndarray, players: np.ndarray, bombs: np.ndarray, my_id: 
     me_alive = 0
     my_pos = (0, 0)
     bombs_left = 0
-    bomb_radius = 1
     if my_id < len(players) and int(players[my_id][2]) == 1:
         me_alive = 1
         mr, mc = int(players[my_id][0]), int(players[my_id][1])
@@ -568,7 +792,6 @@ def encode_obs(grid: np.ndarray, players: np.ndarray, bombs: np.ndarray, my_id: 
         if in_bounds(mr, mc):
             state[13, mr, mc] = 1.0
         bombs_left = int(players[my_id][3])
-        bomb_radius = 1 + int(players[my_id][4])
 
     state[14].fill(normalize_scalar(bombs_left, 5.0))
 
@@ -578,7 +801,8 @@ def encode_obs(grid: np.ndarray, players: np.ndarray, bombs: np.ndarray, my_id: 
             r, c = int(b[0]), int(b[1])
             if not in_bounds(r, c):
                 continue
-            state[15, r, c] = max(state[15, r, c], 1.0 / float(max(int(eff_times[i]), 1)))
+            t = max(int(eff_times[i]), 1)
+            state[15, r, c] = max(state[15, r, c], 1.0 / float(t))
             owner = int(b[3]) if len(b) > 3 else -1
             state[16, r, c] = max(state[16, r, c], normalize_scalar(bomb_radius_for_owner(players, owner), 6.0))
     else:
@@ -599,7 +823,7 @@ def encode_obs(grid: np.ndarray, players: np.ndarray, bombs: np.ndarray, my_id: 
         state[17].fill(norm_dist(d_item))
         state[18].fill(norm_dist(d_enemy))
         state[19].fill(normalize_scalar(bfs_reachable_count(grid, my_pos, bombs, max_depth=3), 20.0))
-        state[20].fill(float(bfs_escape_available(grid, my_pos, players, bombs, max_depth=6)))
+        state[20].fill(time_safe_escape_score(grid, players, bombs, my_id))
         state[21] = safe_to_bomb_plane(grid, players, bombs, my_id)
     else:
         state[17].fill(1.0)
@@ -610,12 +834,16 @@ def encode_obs(grid: np.ndarray, players: np.ndarray, bombs: np.ndarray, my_id: 
 
     state[22].fill(normalize_scalar(len(bombs) if bombs is not None else 0, 10.0))
     state[23].fill(normalize_scalar(step, float(MAX_STEPS)))
+    state[24] = bomb_pressure_plane(grid, players, bombs, my_id)
+    state[25] = future_bomb_pressure_plane(grid, players, bombs, my_id)
+    state[26] = bottleneck_risk_plane(grid, players, bombs, my_id)
 
     return torch.from_numpy(state)
 
 
 # =============================================================================
 # Teacher ensemble
+
 # =============================================================================
 
 class _FallbackRuleAgent:
@@ -681,6 +909,7 @@ class TeacherWeights:
     random: float = 0.25
 
 
+
 class TeacherEnsemble:
     def __init__(self, agent_id: int):
         self.agent_id = int(agent_id)
@@ -693,7 +922,7 @@ class TeacherEnsemble:
         self.weights = TeacherWeights()
 
     def _collect_actions(self, obs: Dict) -> Dict[str, int]:
-        actions = {
+        return {
             "tactical": int(self.tactical.act(obs)),
             "genius": int(self.genius.act(obs)),
             "smarter": int(self.smarter.act(obs)),
@@ -701,31 +930,71 @@ class TeacherEnsemble:
             "simple": int(self.simple.act(obs)),
             "random": int(self.random.act(obs)),
         }
-        return actions
 
     def _weighted_vote(self, actions: Dict[str, int], legal: Optional[set] = None) -> int:
-        weights = self.weights
         score = Counter()
-        score[actions["tactical"]] += weights.tactical
-        score[actions["genius"]] += weights.genius
-        score[actions["smarter"]] += weights.smarter
-        score[actions["box_farmer"]] += weights.box_farmer
-        score[actions["simple"]] += weights.simple
-        score[actions["random"]] += weights.random
+        score[actions["tactical"]] += self.weights.tactical
+        score[actions["genius"]] += self.weights.genius
+        score[actions["smarter"]] += self.weights.smarter
+        score[actions["box_farmer"]] += self.weights.box_farmer
+        score[actions["simple"]] += self.weights.simple
+        score[actions["random"]] += self.weights.random
 
         if legal is not None:
             for a in list(score.keys()):
                 if a not in legal:
                     score[a] -= 10.0
 
-        # deterministic tie-break: tactical > genius > smarter > box_farmer > simple > random
-        priority = [actions["tactical"], actions["genius"], actions["smarter"], actions["box_farmer"], actions["simple"], actions["random"]]
+        priority = [
+            actions["tactical"],
+            actions["genius"],
+            actions["smarter"],
+            actions["box_farmer"],
+            actions["simple"],
+            actions["random"],
+        ]
         best_score = max(score.values())
         candidates = [a for a, s in score.items() if abs(s - best_score) < 1e-9]
         for preferred in priority:
             if preferred in candidates:
                 return int(preferred)
         return int(candidates[0])
+
+    def _move_score(self, grid: np.ndarray, players: np.ndarray, bombs: np.ndarray, pos: Tuple[int, int]) -> float:
+        if not passable(grid, pos[0], pos[1]):
+            return -1e9
+        blocked = bomb_positions_set(bombs)
+        if pos in blocked:
+            return -1e9
+
+        # Hard safety first.
+        margin = escape_margin_from_position(grid, players, bombs, pos, max_depth=6)
+        if margin <= 0:
+            return -1000.0
+
+        score = 2.0 * margin
+        if danger_plane(grid, players, bombs, timer_threshold=1)[pos[0], pos[1]] > 0.0:
+            score -= 5.0
+        if bomb_pressure_plane(grid, players, bombs, self.agent_id)[pos[0], pos[1]] > 0.0:
+            score -= 2.0
+        if future_bomb_pressure_plane(grid, players, bombs, self.agent_id)[pos[0], pos[1]] > 0.0:
+            score -= 1.0
+
+        # Prefer routes that still keep options open.
+        reachable = bfs_reachable_count(grid, pos, bombs, max_depth=3)
+        score += 0.05 * float(reachable)
+        return float(score)
+
+    def _best_escape_action(self, grid: np.ndarray, players: np.ndarray, bombs: np.ndarray, legal: set, my_pos: Tuple[int, int]) -> int:
+        best_action = 0
+        best_score = -1e18
+        for a in movement_actions_from_legal(legal):
+            nr, nc = next_pos(my_pos, a)
+            s = self._move_score(grid, players, bombs, (nr, nc))
+            if s > best_score:
+                best_score = s
+                best_action = int(a)
+        return int(best_action)
 
     def act(self, obs: Dict) -> int:
         grid = obs["map"]
@@ -741,30 +1010,43 @@ class TeacherEnsemble:
 
         actions = self._collect_actions(obs)
 
-        # If immediately in danger, prefer actions that escape danger.
         danger = danger_plane(grid, players, bombs, timer_threshold=1)
-        if danger[r, c] > 0.0:
-            safe_acts = []
-            for a in movement_actions_from_legal(legal):
-                nr, nc = next_pos((r, c), a)
-                if in_bounds(nr, nc) and danger[nr, nc] == 0.0:
-                    safe_acts.append(a)
-            if safe_acts:
-                # keep tactical priority, but only among safe movement actions
-                for key in ("tactical", "genius", "smarter", "simple", "box_farmer", "random"):
-                    a = actions[key]
-                    if a in safe_acts:
-                        return int(a)
-                return int(random.choice(safe_acts))
+        current_pressure = bomb_pressure_plane(grid, players, bombs, self.agent_id)
+        future_pressure = future_bomb_pressure_plane(grid, players, bombs, self.agent_id)
+        bottleneck = bottleneck_risk_plane(grid, players, bombs, self.agent_id)
 
-        # If we are safe and boxes are plentiful, box_farmer gains slightly more weight.
+        # If we are in danger or in a brittle corridor, prefer the safest move.
+        if danger[r, c] > 0.0 or bottleneck[r, c] > 0.65 or current_pressure[r, c] > 0.0:
+            safe_move = self._best_escape_action(grid, players, bombs, legal, (r, c))
+            if safe_move in legal and safe_move != 0:
+                return int(safe_move)
+
+        # Only consider bomb placement if it is tactically useful and survivable.
+        if 5 in legal and should_place_bomb_here(grid, players, bombs, self.agent_id, (r, c)):
+            # When the ensemble strongly prefers bombing, let it through.
+            if actions["tactical"] == 5 or actions["genius"] == 5 or actions["smarter"] == 5:
+                return 5
+            # If we are near boxes/enemies and not under threat, bomb is often the right move.
+            blast = blast_tiles(grid, r, c, 1 + int(players[self.agent_id][4]))
+            hit_boxes = any(int(grid[x, y]) == 2 for x, y in blast)
+            hit_enemy = any(
+                (x, y) in {
+                    (int(players[i][0]), int(players[i][1]))
+                    for i in range(4)
+                    if i != self.agent_id and i < len(players) and int(players[i][2]) == 1
+                }
+                for x, y in blast
+            )
+            if (hit_boxes or hit_enemy) and danger[r, c] == 0.0 and current_pressure[r, c] == 0.0:
+                return 5
+
+        # Heuristic weighting tweaks.
         box_count = int(np.sum(grid == 2))
         if box_count >= 18:
             self.weights.box_farmer = 2.2
         else:
             self.weights.box_farmer = 1.2
 
-        # If few enemies alive, tactical/genius are more useful than random.
         alive_cnt = int(np.sum(players[:, 2])) if len(players) else 0
         if alive_cnt <= 2:
             self.weights.tactical = 3.5
@@ -775,11 +1057,34 @@ class TeacherEnsemble:
             self.weights.genius = 2.5
             self.weights.smarter = 2.0
 
-        return self._weighted_vote(actions, legal=legal)
+        # If enemy pressure is high, make the ensemble more conservative.
+        if current_pressure[r, c] > 0.0 or future_pressure[r, c] > 0.0:
+            self.weights.random = 0.05
+            self.weights.simple = 0.5
+        else:
+            self.weights.random = 0.25
+            self.weights.simple = 0.75
+
+        # Prefer the safest legal move if the vote picks an unsafe action while threat is active.
+        vote = self._weighted_vote(actions, legal=legal)
+        if vote == 5 and 5 in legal and not should_place_bomb_here(grid, players, bombs, self.agent_id, (r, c)):
+            vote = self._best_escape_action(grid, players, bombs, legal, (r, c))
+            if vote == 0 and 0 in legal:
+                return 0
+
+        if vote in (1, 2, 3, 4) and danger[r, c] > 0.0:
+            nr, nc = next_pos((r, c), vote)
+            if not passable(grid, nr, nc) or danger[nr, nc] > 0.0:
+                alt = self._best_escape_action(grid, players, bombs, legal, (r, c))
+                if alt in legal:
+                    return int(alt)
+
+        return int(vote)
 
 
 # =============================================================================
 # Model
+
 # =============================================================================
 class ResidualBlock(nn.Module):
     def __init__(self, channels: int, dropout: float = 0.05):
