@@ -985,7 +985,7 @@ def compute_class_weights(chunk_dir: str) -> torch.Tensor:
 # =============================================================================
 def build_opponents(controlled_id: int, game_seed: int) -> Dict[int, object]:
     rng = random.Random(game_seed)
-    pool = [cls for cls in [TacticalRuleAgent, GeniusRuleAgent, SmarterRuleAgent, BoxFarmerAgent, SimpleRuleAgent, RandomAgent] if cls is not None]
+    pool = [cls for cls in [TacticalRuleAgent, GeniusRuleAgent, SmarterRuleAgent, BoxFarmerAgent] if cls is not None]
     if not pool:
         pool = [_FallbackRuleAgent]
 
