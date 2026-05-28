@@ -2437,7 +2437,10 @@ def main():
     # model = train_policy_model(TRAIN_DIR, VAL_DIR, init_model_path=MODEL_PATH, lr=FINE_TUNE_LR)
     
     model = BomberNet(INPUT_CHANNELS).to(DEVICE)   
-    pretrained_path = "model_bc_best.pth"            # đường dẫn tới model cũ
+    
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    pretrained_path = os.path.join(current_dir, "model_bc_best.pth")
+
     if os.path.exists(pretrained_path):
         state = torch.load(pretrained_path, map_location=DEVICE)
         model.load_state_dict(state, strict=False)   # bỏ qua mismatch ở value head
