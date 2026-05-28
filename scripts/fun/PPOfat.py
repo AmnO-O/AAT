@@ -1669,11 +1669,24 @@ import copy
 from torch.distributions import Categorical
 
 # Training knobs for the actor-critic stage.
+RL_ROUNDS = 3
+ROLLOUT_GAMES_PER_ROUND = 120
+PPO_EPOCHS = 4
+PPO_BATCH_SIZE = 256
+PPO_CLIP_EPS = 0.20
+PPO_GAMMA = 0.98
+PPO_LAMBDA = 0.95
+PPO_VALUE_COEF = 0.5
+PPO_ENTROPY_COEF = 0.01
+PPO_MAX_GRAD_NORM = 1.0
+BC_MIX_COEF = 0.15
+MIXED_DAGGER_GAMES = 120
+
 RL_ROUNDS = 4
 ROLLOUT_GAMES_PER_ROUND = 250
 PPO_EPOCHS = 6
 PPO_BATCH_SIZE = 128
-PPO_CLIP_EPS = 0.16
+PPO_CLIP_EPS = 0.15
 PPO_GAMMA = 0.99
 PPO_LAMBDA = 0.95
 PPO_VALUE_COEF = 0.5
@@ -2422,31 +2435,19 @@ def main():
         for name, err in BASELINE_IMPORT_ERRORS:
             print(f"  - {name}: {err}", flush=True)
 
-    # print("=== Phase 1: Collect initial demonstrations ===", flush=True)
-    # collect_initial_data(TRAIN_DIR, VAL_DIR, INITIAL_GAMES)
+    print("=== Phase 1: Collect initial demonstrations ===", flush=True)
+    collect_initial_data(TRAIN_DIR, VAL_DIR, INITIAL_GAMES)
 
-    # print("=== Phase 2: Train BC policy/value backbone ===", flush=True)
-    # model = train_policy_model(TRAIN_DIR, VAL_DIR, init_model_path=None, lr=LEARNING_RATE)
+    print("=== Phase 2: Train BC policy/value backbone ===", flush=True)
+    model = train_policy_model(TRAIN_DIR, VAL_DIR, init_model_path=None, lr=LEARNING_RATE)
 
-    # print("=== Phase 3: DAgger correction pass ===", flush=True)
-    # new_samples = collect_dagger_data(model, TRAIN_DIR, MIXED_DAGGER_GAMES)
-    # print(f"DAgger collected {new_samples} corrective samples", flush=True)
+    print("=== Phase 3: DAgger correction pass ===", flush=True)
+    new_samples = collect_dagger_data(model, TRAIN_DIR, MIXED_DAGGER_GAMES)
+    print(f"DAgger collected {new_samples} corrective samples", flush=True)
 
-    # print("=== Phase 4: Refresh BC after DAgger ===", flush=True)
-    # model = train_policy_model(TRAIN_DIR, VAL_DIR, init_model_path=MODEL_PATH, lr=FINE_TUNE_LR)
-    
-    model = BomberNet(INPUT_CHANNELS).to(DEVICE)   
-    
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    pretrained_path = os.path.join(current_dir, "model_bc_best.pth")
+    print("=== Phase 4: Refresh BC after DAgger ===", flush=True)
+    model = train_policy_model(TRAIN_DIR, VAL_DIR, init_model_path=MODEL_PATH, lr=FINE_TUNE_LR)
 
-    if os.path.exists(pretrained_path):
-        state = torch.load(pretrained_path, map_location=DEVICE)
-        model.load_state_dict(state, strict=False)   # bỏ qua mismatch ở value head
-        print(f"Loaded pretrained weights from {pretrained_path}")
-    else:
-        raise FileNotFoundError(f"Can't find {pretrained_path}")
-    
     print("=== Phase 5: Self-play actor-critic fine-tuning ===", flush=True)
     for round_idx in range(RL_ROUNDS):
         frozen = copy.deepcopy(model).to(DEVICE)
