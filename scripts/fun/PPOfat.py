@@ -1669,18 +1669,17 @@ import copy
 from torch.distributions import Categorical
 
 # Training knobs for the actor-critic stage.
-RL_ROUNDS = 3
-ROLLOUT_GAMES_PER_ROUND = 120
-PPO_EPOCHS = 4
-PPO_BATCH_SIZE = 256
-PPO_CLIP_EPS = 0.20
-PPO_GAMMA = 0.98
+RL_ROUNDS = 4
+ROLLOUT_GAMES_PER_ROUND = 250
+PPO_EPOCHS = 6
+PPO_BATCH_SIZE = 128
+PPO_CLIP_EPS = 0.16
+PPO_GAMMA = 0.99
 PPO_LAMBDA = 0.95
 PPO_VALUE_COEF = 0.5
-PPO_ENTROPY_COEF = 0.01
-PPO_MAX_GRAD_NORM = 1.0
-BC_MIX_COEF = 0.15
-MIXED_DAGGER_GAMES = 120
+PPO_ENTROPY_COEF = 0.02
+PPO_MAX_GRAD_NORM = 1
+BC_MIX_COEF = 0.10
 
 # -----------------------------------------------------------------------------
 # Policy/value model
