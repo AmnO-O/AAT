@@ -2547,7 +2547,7 @@ def main():
     model = BomberNet(INPUT_CHANNELS).to(DEVICE)
 
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    pretrained_path = os.path.join(current_dir, "model_bc_best.pth")
+    pretrained_path = os.path.join(current_dir, "model_bc.pth")
     if os.path.exists(pretrained_path):
         state = torch.load(pretrained_path, map_location=DEVICE)
         model.load_state_dict(state, strict=False)
