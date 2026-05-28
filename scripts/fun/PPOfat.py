@@ -1591,9 +1591,10 @@ def quick_eval_against_baselines(model: nn.Module, num_games: int = 20) -> None:
     wins = 0
     draws = 0
     losses = 0
+    total_survival_steps = 0
 
     for game_idx in range(num_games):
-        seed = 200000 + SEED + game_idx
+        seed = 400000 + SEED + game_idx
         controlled_id = game_idx % 4
         env = BomberEnv(max_steps=MAX_STEPS, seed=seed)
         obs = env.reset()
@@ -1602,20 +1603,36 @@ def quick_eval_against_baselines(model: nn.Module, num_games: int = 20) -> None:
         done = False
         step = 0
         while not done:
+            if controlled_id >= len(obs["players"]) or int(obs["players"][controlled_id][2]) != 1:
+                break
+
+            state = encode_obs(obs["map"], obs["players"], obs["bombs"], controlled_id, step).unsqueeze(0).to(DEVICE)
+            my_pos = (int(obs["players"][controlled_id][0]), int(obs["players"][controlled_id][1]))
+            bombs_left = int(obs["players"][controlled_id][3])
+            legal_mask = _legal_action_mask(obs["map"], obs["bombs"], my_pos, bombs_left)
+
             with torch.no_grad():
-                state = encode_obs(obs["map"], obs["players"], obs["bombs"], controlled_id, step).unsqueeze(0).to(DEVICE)
-                logits = model(state)
-                action = int(torch.argmax(logits, dim=1).item())
+                action, _, _, _ = _sample_masked_action(model, state, legal_mask=legal_mask, sample=False)
+
+            # --- SAFETY BFS ESCAPE ---
+            if action != 5 and action != 0:
+                danger_now = danger_plane(obs["map"], obs["players"], obs["bombs"], timer_threshold=1)
+                nx, ny = next_pos(my_pos, action)
+                if danger_now[nx, ny] > 0.0:
+                    escape = bfs_escape_action(obs["map"], obs["players"], obs["bombs"], my_pos)
+                    if escape is not None:
+                        action = escape
+            # -------------------------
 
             actions = [0, 0, 0, 0]
             actions[controlled_id] = action
             for pid, agent in opponents.items():
                 actions[pid] = int(agent.act(obs))
-
             obs, terminated, truncated = env.step(actions)
             done = bool(terminated or truncated)
             step += 1
 
+        total_survival_steps += step
         alive = [int(p[2]) for p in obs["players"]]
         my_alive = alive[controlled_id]
         alive_count = sum(alive)
@@ -1626,8 +1643,8 @@ def quick_eval_against_baselines(model: nn.Module, num_games: int = 20) -> None:
         else:
             losses += 1
 
-    print(f"Quick eval proxy | wins={wins} draws={draws} losses={losses}", flush=True)
-
+    avg_steps = total_survival_steps / max(1, num_games)
+    print(f"Quick eval proxy | wins={wins} draws={draws} losses={losses} | avg_survival_steps={avg_steps:.1f}", flush=True)
 
 # =============================================================================
 # Main
@@ -2435,18 +2452,29 @@ def main():
         for name, err in BASELINE_IMPORT_ERRORS:
             print(f"  - {name}: {err}", flush=True)
 
-    print("=== Phase 1: Collect initial demonstrations ===", flush=True)
-    collect_initial_data(TRAIN_DIR, VAL_DIR, INITIAL_GAMES)
+    # print("=== Phase 1: Collect initial demonstrations ===", flush=True)
+    # collect_initial_data(TRAIN_DIR, VAL_DIR, INITIAL_GAMES)
 
-    print("=== Phase 2: Train BC policy/value backbone ===", flush=True)
-    model = train_policy_model(TRAIN_DIR, VAL_DIR, init_model_path=None, lr=LEARNING_RATE)
+    # print("=== Phase 2: Train BC policy/value backbone ===", flush=True)
+    # model = train_policy_model(TRAIN_DIR, VAL_DIR, init_model_path=None, lr=LEARNING_RATE)
 
-    print("=== Phase 3: DAgger correction pass ===", flush=True)
-    new_samples = collect_dagger_data(model, TRAIN_DIR, MIXED_DAGGER_GAMES)
-    print(f"DAgger collected {new_samples} corrective samples", flush=True)
+    # print("=== Phase 3: DAgger correction pass ===", flush=True)
+    # new_samples = collect_dagger_data(model, TRAIN_DIR, MIXED_DAGGER_GAMES)
+    # print(f"DAgger collected {new_samples} corrective samples", flush=True)
 
-    print("=== Phase 4: Refresh BC after DAgger ===", flush=True)
-    model = train_policy_model(TRAIN_DIR, VAL_DIR, init_model_path=MODEL_PATH, lr=FINE_TUNE_LR)
+    # print("=== Phase 4: Refresh BC after DAgger ===", flush=True)
+    # model = train_policy_model(TRAIN_DIR, VAL_DIR, init_model_path=MODEL_PATH, lr=FINE_TUNE_LR)
+
+    model = BomberNet(INPUT_CHANNELS).to(DEVICE)
+
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    pretrained_path = os.path.join(current_dir, "model_bc_best.pth")
+    if os.path.exists(pretrained_path):
+        state = torch.load(pretrained_path, map_location=DEVICE)
+        model.load_state_dict(state, strict=False)
+        print(f"Loaded pretrained weights from {pretrained_path}")
+    else:
+        raise FileNotFoundError(f"Can't find {pretrained_path}")
 
     print("=== Phase 5: Self-play actor-critic fine-tuning ===", flush=True)
     for round_idx in range(RL_ROUNDS):
