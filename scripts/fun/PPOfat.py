@@ -1591,10 +1591,9 @@ def quick_eval_against_baselines(model: nn.Module, num_games: int = 20) -> None:
     wins = 0
     draws = 0
     losses = 0
-    total_survival_steps = 0
 
     for game_idx in range(num_games):
-        seed = 400000 + SEED + game_idx
+        seed = 200000 + SEED + game_idx
         controlled_id = game_idx % 4
         env = BomberEnv(max_steps=MAX_STEPS, seed=seed)
         obs = env.reset()
@@ -1603,36 +1602,33 @@ def quick_eval_against_baselines(model: nn.Module, num_games: int = 20) -> None:
         done = False
         step = 0
         while not done:
-            if controlled_id >= len(obs["players"]) or int(obs["players"][controlled_id][2]) != 1:
-                break
-
-            state = encode_obs(obs["map"], obs["players"], obs["bombs"], controlled_id, step).unsqueeze(0).to(DEVICE)
-            my_pos = (int(obs["players"][controlled_id][0]), int(obs["players"][controlled_id][1]))
-            bombs_left = int(obs["players"][controlled_id][3])
-            legal_mask = _legal_action_mask(obs["map"], obs["bombs"], my_pos, bombs_left)
-
             with torch.no_grad():
-                action, _, _, _ = _sample_masked_action(model, state, legal_mask=legal_mask, sample=False)
-
-            # --- SAFETY BFS ESCAPE ---
-            if action != 5 and action != 0:
-                danger_now = danger_plane(obs["map"], obs["players"], obs["bombs"], timer_threshold=1)
-                nx, ny = next_pos(my_pos, action)
-                if danger_now[nx, ny] > 0.0:
-                    escape = bfs_escape_action(obs["map"], obs["players"], obs["bombs"], my_pos)
-                    if escape is not None:
-                        action = escape
-            # -------------------------
+                state = encode_obs(obs["map"], obs["players"], obs["bombs"], controlled_id, step).unsqueeze(0).to(DEVICE)
+                my_pos = (int(obs["players"][controlled_id][0]), int(obs["players"][controlled_id][1]))
+                bombs_left = int(obs["players"][controlled_id][3])
+                legal_mask = _legal_action_mask(obs["map"], obs["bombs"], my_pos, bombs_left)
+                shielded_mask = _shielded_legal_mask(
+                    obs["map"],
+                    obs["players"],
+                    obs["bombs"],
+                    controlled_id,
+                    legal_mask,
+                )
+                logits = model(state)
+                masked_logits = logits.clone()
+                mask = torch.tensor(shielded_mask, dtype=torch.bool, device=logits.device).unsqueeze(0)
+                masked_logits[~mask] = -1e9
+                action = int(torch.argmax(masked_logits, dim=1).item())
 
             actions = [0, 0, 0, 0]
             actions[controlled_id] = action
             for pid, agent in opponents.items():
                 actions[pid] = int(agent.act(obs))
+
             obs, terminated, truncated = env.step(actions)
             done = bool(terminated or truncated)
             step += 1
 
-        total_survival_steps += step
         alive = [int(p[2]) for p in obs["players"]]
         my_alive = alive[controlled_id]
         alive_count = sum(alive)
@@ -1643,8 +1639,8 @@ def quick_eval_against_baselines(model: nn.Module, num_games: int = 20) -> None:
         else:
             losses += 1
 
-    avg_steps = total_survival_steps / max(1, num_games)
-    print(f"Quick eval proxy | wins={wins} draws={draws} losses={losses} | avg_survival_steps={avg_steps:.1f}", flush=True)
+    print(f"Quick eval proxy | wins={wins} draws={draws} losses={losses}", flush=True)
+
 
 # =============================================================================
 # Main
@@ -1699,6 +1695,7 @@ PPO_MAX_GRAD_NORM = 1.0
 BC_MIX_COEF = 0.15
 MIXED_DAGGER_GAMES = 120
 
+
 RL_ROUNDS = 4
 ROLLOUT_GAMES_PER_ROUND = 250
 PPO_EPOCHS = 6
@@ -1710,6 +1707,7 @@ PPO_VALUE_COEF = 0.5
 PPO_ENTROPY_COEF = 0.02
 PPO_MAX_GRAD_NORM = 1
 BC_MIX_COEF = 0.10
+
 
 # -----------------------------------------------------------------------------
 # Policy/value model
@@ -1782,6 +1780,73 @@ def _legal_action_mask(grid: np.ndarray, bombs: np.ndarray, my_pos: Tuple[int, i
     return mask
 
 
+
+
+def _shielded_legal_mask(
+    grid: np.ndarray,
+    players: np.ndarray,
+    bombs: np.ndarray,
+    my_id: int,
+    legal_mask: np.ndarray,
+) -> np.ndarray:
+    """
+    Safety shield for rollout collection.
+
+    This is applied BEFORE action sampling so the sampled action and its log_prob
+    still match the executed behavior policy.
+    """
+    mask = np.array(legal_mask, dtype=np.float32, copy=True)
+
+    if my_id >= len(players) or int(players[my_id][2]) != 1:
+        if mask.sum() <= 0:
+            mask[0] = 1.0
+        return mask
+
+    my_pos = (int(players[my_id][0]), int(players[my_id][1]))
+    blocked = bomb_positions_set(bombs)
+
+    danger_now = danger_plane(grid, players, bombs, timer_threshold=1)
+    danger_soon = danger_plane(grid, players, bombs, timer_threshold=2)
+    in_danger = bool(danger_now[my_pos[0], my_pos[1]] > 0.0 or danger_soon[my_pos[0], my_pos[1]] > 0.0)
+
+    # If we're already threatened, keep only actions that move to a tile
+    # with a real time-safe escape margin.
+    if in_danger:
+        safe_moves = []
+        for a in (1, 2, 3, 4):
+            if mask[a] <= 0.0:
+                continue
+            nr, nc = next_pos(my_pos, a)
+            if not passable(grid, nr, nc):
+                mask[a] = 0.0
+                continue
+            if (nr, nc) in blocked:
+                mask[a] = 0.0
+                continue
+            if escape_margin_from_position(grid, players, bombs, (nr, nc), max_depth=6) > 0.0:
+                safe_moves.append(a)
+            else:
+                mask[a] = 0.0
+
+        # Prefer escaping over waiting if any escape exists.
+        if safe_moves:
+            mask[0] = 0.0
+        else:
+            # Keep STOP as the least-bad fallback if no escape is proven.
+            if mask[0] <= 0.0:
+                mask[0] = 1.0
+
+    else:
+        # Outside immediate danger, suppress suicidal bomb placements.
+        if mask[5] > 0.0 and not should_place_bomb_here(grid, players, bombs, my_id, my_pos):
+            mask[5] = 0.0
+
+    if mask.sum() <= 0.0:
+        mask[0] = 1.0
+
+    return mask
+
+
 def _sample_masked_action(
     model: nn.Module,
     state: torch.Tensor,
@@ -1824,12 +1889,19 @@ class FrozenPolicyAgent:
         my_pos = (int(obs["players"][self.agent_id][0]), int(obs["players"][self.agent_id][1]))
         bombs_left = int(obs["players"][self.agent_id][3])
         legal_mask = _legal_action_mask(obs["map"], obs["bombs"], my_pos, bombs_left)
+        shielded_mask = _shielded_legal_mask(
+            obs["map"],
+            obs["players"],
+            obs["bombs"],
+            self.agent_id,
+            legal_mask,
+        )
 
         with torch.no_grad():
             action, _, _, _ = _sample_masked_action(
                 self.model,
                 state,
-                legal_mask=legal_mask,
+                legal_mask=shielded_mask,
                 sample=not self.deterministic,
                 temperature=1.0,
             )
@@ -2240,12 +2312,19 @@ def collect_selfplay_rollouts(model: nn.Module, frozen_model: Optional[nn.Module
             my_pos = (int(obs["players"][controlled_id][0]), int(obs["players"][controlled_id][1]))
             bombs_left = int(obs["players"][controlled_id][3])
             legal_mask = _legal_action_mask(obs["map"], obs["bombs"], my_pos, bombs_left)
+            shielded_mask = _shielded_legal_mask(
+                obs["map"],
+                obs["players"],
+                obs["bombs"],
+                controlled_id,
+                legal_mask,
+            )
 
             with torch.no_grad():
                 action, log_prob, _, value = _sample_masked_action(
                     model,
                     state,
-                    legal_mask=legal_mask,
+                    legal_mask=shielded_mask,
                     sample=True,
                     temperature=0.90,
                 )
@@ -2265,7 +2344,7 @@ def collect_selfplay_rollouts(model: nn.Module, frozen_model: Optional[nn.Module
             ep.dones.append(bool(terminated or truncated or int(next_obs["players"][controlled_id][2]) == 0))
             ep.log_probs.append(float(log_prob))
             ep.values.append(float(value))
-            ep.masks.append(legal_mask.astype(np.float32))
+            ep.masks.append(shielded_mask.astype(np.float32))
 
             obs = next_obs
             done = bool(terminated or truncated or int(next_obs["players"][controlled_id][2]) == 0)
@@ -2447,10 +2526,10 @@ def main():
     ensure_dir(TRAIN_DIR)
     ensure_dir(VAL_DIR)
 
-    if BASELINE_IMPORT_ERRORS:
-        print("Some baseline imports failed; trainer will use fallback rules where needed.", flush=True)
-        for name, err in BASELINE_IMPORT_ERRORS:
-            print(f"  - {name}: {err}", flush=True)
+    # if BASELINE_IMPORT_ERRORS:
+    #     print("Some baseline imports failed; trainer will use fallback rules where needed.", flush=True)
+    #     for name, err in BASELINE_IMPORT_ERRORS:
+    #         print(f"  - {name}: {err}", flush=True)
 
     # print("=== Phase 1: Collect initial demonstrations ===", flush=True)
     # collect_initial_data(TRAIN_DIR, VAL_DIR, INITIAL_GAMES)
@@ -2464,7 +2543,7 @@ def main():
 
     # print("=== Phase 4: Refresh BC after DAgger ===", flush=True)
     # model = train_policy_model(TRAIN_DIR, VAL_DIR, init_model_path=MODEL_PATH, lr=FINE_TUNE_LR)
-
+    
     model = BomberNet(INPUT_CHANNELS).to(DEVICE)
 
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -2475,6 +2554,7 @@ def main():
         print(f"Loaded pretrained weights from {pretrained_path}")
     else:
         raise FileNotFoundError(f"Can't find {pretrained_path}")
+
 
     print("=== Phase 5: Self-play actor-critic fine-tuning ===", flush=True)
     for round_idx in range(RL_ROUNDS):
