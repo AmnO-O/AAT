@@ -1682,17 +1682,17 @@ import copy
 from torch.distributions import Categorical
 
 # Training knobs for the actor-critic stage.
-RL_ROUNDS = 6
+RL_ROUNDS = 5
 ROLLOUT_GAMES_PER_ROUND = 200
-PPO_EPOCHS = 4
+PPO_EPOCHS = 5
 PPO_BATCH_SIZE = 256
 PPO_CLIP_EPS = 0.20
 PPO_GAMMA = 0.98
 PPO_LAMBDA = 0.95
 PPO_VALUE_COEF = 0.5
-PPO_ENTROPY_COEF = 0.03   # giảm dần sau 2 vòng về 0.01
+PPO_ENTROPY_COEF = 0.01
 PPO_MAX_GRAD_NORM = 1.0
-BC_MIX_COEF = 0.10        # giảm dần về 0.05 → 0.02 → 0
+BC_MIX_COEF = 0.15
 MIXED_DAGGER_GAMES = 120
 
 # -----------------------------------------------------------------------------
@@ -1902,7 +1902,7 @@ def build_selfplay_opponents(controlled_id: int, game_seed: int, frozen_model: O
     rng = random.Random(game_seed)
     other_ids = [pid for pid in range(4) if pid != controlled_id]
 
-    baseline_pool = [cls for cls in [TacticalRuleAgent, GeniusRuleAgent, SmarterRuleAgent, BoxFarmerAgent, SimpleRuleAgent] if cls is not None]
+    baseline_pool = [cls for cls in [TacticalRuleAgent, GeniusRuleAgent, SmarterRuleAgent, BoxFarmerAgent, SimpleRuleAgent, RandomAgent] if cls is not None]
     if not baseline_pool:
         baseline_pool = [_FallbackRuleAgent]
 
@@ -1935,17 +1935,15 @@ def compute_shaped_reward(
     truncated: bool,
 ) -> float:
     """
-    Contest-aligned shaping.
+    Contest-aligned shaping tuned to push toward actual wins, not just survival.
 
-    Design goals:
-      - terminal outcome must dominate;
-      - survival should help, but not become the main objective;
-      - kills should matter more than boxes;
-      - boxes and items should matter, but stay below kill / win signals;
-      - unsafe bombs should be discouraged hard enough that the policy does not
-        learn to suicide for tiny short-term gain.
+    Priorities:
+      1) winning / final placement
+      2) kills
+      3) productive pressure (boxes, items, safe bombs)
+      4) survival, but only as a necessary condition
     """
-    reward = 0.002  # tiny living reward
+    reward = 0.0
 
     prev_players = prev_obs["players"]
     next_players = next_obs["players"]
@@ -1956,27 +1954,28 @@ def compute_shaped_reward(
         prev_alive = int(prev_players[my_id][2])
         next_alive = int(next_players[my_id][2])
 
-        # Survival / death signal.
+        # Small survival credit, but much smaller than the old version.
         if prev_alive == 1 and next_alive == 1:
-            reward += 0.002
+            reward += 0.001
         elif prev_alive == 1 and next_alive == 0:
-            reward -= 5.0
+            reward -= 6.0
 
-        # Radius item: directly observable from the bonus delta.
+        # Radius growth matters, but should not dominate kill / win signals.
         prev_bonus = int(prev_players[my_id][4])
         next_bonus = int(next_players[my_id][4])
-        if next_bonus > prev_bonus:
-            reward += 0.08 * (next_bonus - prev_bonus)
+        bonus_gain = max(0, next_bonus - prev_bonus)
+        if bonus_gain > 0:
+            reward += 0.04 * bonus_gain
 
-        # Item pickup: capacity is slightly more valuable because it unlocks tempo.
+        # Item pickup: useful, but still below combat importance.
         next_pos = (int(next_players[my_id][0]), int(next_players[my_id][1]))
         if 0 <= next_pos[0] < prev_map.shape[0] and 0 <= next_pos[1] < prev_map.shape[1]:
             prev_cell = int(prev_map[next_pos[0], next_pos[1]])
             next_cell = int(next_map[next_pos[0], next_pos[1]])
             if prev_cell in (3, 4) and next_cell == 0:
-                reward += 0.08 if prev_cell == 4 else 0.05
+                reward += 0.04 if prev_cell == 3 else 0.06
 
-    # Kill signal: strong, and even stronger in the late game.
+    # Enemy kills are the main dense signal besides survival.
     prev_enemy_alive = int(np.sum(prev_players[:, 2])) if len(prev_players) else 0
     next_enemy_alive = int(np.sum(next_players[:, 2])) if len(next_players) else 0
     if my_id < len(prev_players):
@@ -1985,52 +1984,53 @@ def compute_shaped_reward(
         next_enemy_alive -= int(next_players[my_id][2])
     enemy_kills = max(0, prev_enemy_alive - next_enemy_alive)
     if enemy_kills > 0:
-        kill_bonus = 1.0
+        kill_bonus = 1.2
         if next_enemy_alive <= 1:
-            kill_bonus += 0.5
+            kill_bonus += 0.8
         reward += kill_bonus * enemy_kills
 
-    # Box destruction: useful, but should not dominate the game.
+    # Box destruction stays useful, but intentionally low.
     prev_boxes = int(np.sum(prev_map == 2))
     next_boxes = int(np.sum(next_map == 2))
     boxes_destroyed = max(0, prev_boxes - next_boxes)
     if boxes_destroyed > 0:
-        reward += 0.02 * boxes_destroyed
+        reward += 0.01 * boxes_destroyed
         if boxes_destroyed >= 2:
-            reward += 0.01 * (boxes_destroyed - 1)
+            reward += 0.003 * (boxes_destroyed - 1)
 
-    # Bomb placement: encourage only safe / meaningful bombs.
+    # Bomb placement should only be rewarded when it is clearly productive.
     if action == 5:
         if my_id < len(prev_players) and int(prev_players[my_id][2]) == 1:
             my_pos = (int(prev_players[my_id][0]), int(prev_players[my_id][1]))
             if should_place_bomb_here(prev_map, prev_players, prev_obs["bombs"], my_id, my_pos):
-                reward += 0.02
+                reward += 0.03
             else:
-                reward -= 0.15
+                reward -= 0.20
         else:
-            reward -= 0.03
+            reward -= 0.05
 
-    # Light anti-stalling pressure. This stays small so it does not overpower the game.
-    reward -= 0.003
+    # Light anti-stalling pressure.
+    reward -= 0.004
 
-    # Terminal reward dominates the episode.
+    # Terminal reward must dominate, and non-win survival should not feel too good.
     if terminated or truncated:
         if my_id < len(next_players) and int(next_players[my_id][2]) == 1:
             alive_count = int(np.sum(next_players[:, 2]))
             if alive_count == 1:
-                reward += 8.0
+                reward += 10.0
             else:
-                # Surviving to the end is good, but much less important than winning.
-                reward += 0.35 + 0.10 * max(0, 4 - alive_count)
+                # Still alive at the end, but not the sole winner.
+                reward += 0.05
         else:
-            reward -= 1.5
+            reward -= 2.0
 
-    return float(np.clip(reward, -10.0, 10.0))
+    return float(np.clip(reward, -12.0, 12.0))
 
 
 # -----------------------------------------------------------------------------
 # Rollout storage
 # -----------------------------------------------------------------------------
+
 @dataclass
 class RolloutEpisode:
     states: List[np.ndarray]
@@ -2320,14 +2320,19 @@ def train_policy_model(train_dir: str, val_dir: str, init_model_path: Optional[s
 # -----------------------------------------------------------------------------
 # Self-play rollouts + PPO fine-tuning
 # -----------------------------------------------------------------------------
-def collect_selfplay_rollouts(model: nn.Module, frozen_model: Optional[nn.Module], num_games: int) -> List[RolloutEpisode]:
+def collect_selfplay_rollouts(
+    model: nn.Module,
+    frozen_model: Optional[nn.Module],
+    num_games: int,
+    round_idx: int = 0,
+) -> List[RolloutEpisode]:
     model.eval()
     if frozen_model is not None:
         frozen_model.eval()
 
     episodes: List[RolloutEpisode] = []
     for game_idx in range(num_games):
-        seed = 300000 + SEED + game_idx
+        seed = 300000 + SEED + round_idx * 10000 + game_idx
         controlled_id = game_idx % 4
 
         env = BomberEnv(max_steps=MAX_STEPS, seed=seed)
@@ -2524,37 +2529,16 @@ def quick_eval_against_baselines(model: nn.Module, num_games: int = 20) -> None:
         while not done:
             if controlled_id >= len(obs["players"]) or int(obs["players"][controlled_id][2]) != 1:
                 break
-
             state = encode_obs(obs["map"], obs["players"], obs["bombs"], controlled_id, step).unsqueeze(0).to(DEVICE)
             my_pos = (int(obs["players"][controlled_id][0]), int(obs["players"][controlled_id][1]))
             bombs_left = int(obs["players"][controlled_id][3])
-
-            # Legal action mask
             legal_mask = _legal_action_mask(obs["map"], obs["bombs"], my_pos, bombs_left)
-
-            # Shielded mask – just like in training rollouts
-            shielded_mask = _shielded_legal_mask(
-                obs["map"],
-                obs["players"],
-                obs["bombs"],
-                controlled_id,
-                legal_mask,
-            )
-
-            # Choose action deterministically (argmax) but respecting shielded mask
             with torch.no_grad():
-                action, _, _, _ = _sample_masked_action(
-                    model,
-                    state,
-                    legal_mask=shielded_mask,   # sử dụng shielded mask
-                    sample=False,
-                )
-
+                action, _, _, _ = _sample_masked_action(model, state, legal_mask=legal_mask, sample=False)
             actions = [0, 0, 0, 0]
             actions[controlled_id] = action
             for pid, agent in opponents.items():
                 actions[pid] = int(agent.act(obs))
-
             obs, terminated, truncated = env.step(actions)
             done = bool(terminated or truncated)
             step += 1
@@ -2572,6 +2556,8 @@ def quick_eval_against_baselines(model: nn.Module, num_games: int = 20) -> None:
 
     avg_steps = total_survival_steps / max(1, num_games)
     print(f"Quick eval proxy | wins={wins} draws={draws} losses={losses} | avg_survival_steps={avg_steps:.1f}", flush=True)
+
+
 # -----------------------------------------------------------------------------
 # Main override
 # -----------------------------------------------------------------------------
@@ -2597,10 +2583,10 @@ def main():
     # print("=== Phase 4: Refresh BC after DAgger ===", flush=True)
     # model = train_policy_model(TRAIN_DIR, VAL_DIR, init_model_path=MODEL_PATH, lr=FINE_TUNE_LR)
 
-
     model = BomberNet(INPUT_CHANNELS).to(DEVICE)
+
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    pretrained_path = os.path.join(current_dir, "model_bc.pth")
+    pretrained_path = os.path.join(current_dir, "model_bc_best.pth")
     if os.path.exists(pretrained_path):
         state = torch.load(pretrained_path, map_location=DEVICE)
         model.load_state_dict(state, strict=True)
@@ -2608,14 +2594,17 @@ def main():
     else:
         raise FileNotFoundError(f"Can't find {pretrained_path}")
 
+
     print("=== Phase 5: Self-play actor-critic fine-tuning ===", flush=True)
     for round_idx in range(RL_ROUNDS):
         frozen = copy.deepcopy(model).to(DEVICE)
         frozen.eval()
-        
-        quick_eval_against_baselines(frozen, num_games=20)
-        
-        rollouts = collect_selfplay_rollouts(model, frozen_model=frozen, num_games=ROLLOUT_GAMES_PER_ROUND)
+        rollouts = collect_selfplay_rollouts(
+            model,
+            frozen_model=frozen,
+            num_games=ROLLOUT_GAMES_PER_ROUND,
+            round_idx=round_idx,
+        )
         print(f"Round {round_idx + 1}: collected {len(rollouts)} episodes", flush=True)
         model = ppo_finetune(model, rollouts, bc_mix_dir=TRAIN_DIR)
 
