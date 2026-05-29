@@ -125,7 +125,7 @@ PPO_VALUE_COEF          = 0.5
 PPO_ENTROPY_COEF        = 0.01
 PPO_MAX_GRAD_NORM       = 1.0
 BC_MIX_COEF             = 0.03
-LEAGUE_POOL_SIZE        = 6    # max past checkpoints kept for self-play
+LEAGUE_POOL_SIZE        = 2    # max past checkpoints kept for self-play
 
 
 # ===========================================================================
