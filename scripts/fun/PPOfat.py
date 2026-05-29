@@ -1695,20 +1695,6 @@ PPO_MAX_GRAD_NORM = 1.0
 BC_MIX_COEF = 0.15
 MIXED_DAGGER_GAMES = 120
 
-
-RL_ROUNDS = 4
-ROLLOUT_GAMES_PER_ROUND = 250
-PPO_EPOCHS = 6
-PPO_BATCH_SIZE = 128
-PPO_CLIP_EPS = 0.15
-PPO_GAMMA = 0.99
-PPO_LAMBDA = 0.95
-PPO_VALUE_COEF = 0.5
-PPO_ENTROPY_COEF = 0.02
-PPO_MAX_GRAD_NORM = 1
-BC_MIX_COEF = 0.10
-
-
 # -----------------------------------------------------------------------------
 # Policy/value model
 # -----------------------------------------------------------------------------
@@ -1948,50 +1934,87 @@ def compute_shaped_reward(
     terminated: bool,
     truncated: bool,
 ) -> float:
-    reward = 0.02  # survive one more step
+    """
+    Contest-aligned shaping:
+      - keep per-step rewards small,
+      - make terminal outcome dominate,
+      - reward only productive bombs / box breaking / item pickups.
+    """
+    reward = 0.005  # small living reward
 
     prev_players = prev_obs["players"]
     next_players = next_obs["players"]
+    prev_map = prev_obs["map"]
+    next_map = next_obs["map"]
 
     if my_id < len(prev_players) and my_id < len(next_players):
         prev_alive = int(prev_players[my_id][2])
         next_alive = int(next_players[my_id][2])
 
-        if prev_alive == 1 and next_alive == 0:
-            reward -= 3.0
+        # Survival / death signal.
+        if prev_alive == 1 and next_alive == 1:
+            reward += 0.005
+        elif prev_alive == 1 and next_alive == 0:
+            reward -= 4.0
 
+        # Radius item: directly observable from the bonus delta.
         prev_bonus = int(prev_players[my_id][4])
         next_bonus = int(next_players[my_id][4])
-        reward += 0.12 * max(0, next_bonus - prev_bonus)
+        if next_bonus > prev_bonus:
+            reward += 0.10 * (next_bonus - prev_bonus)
 
-        prev_bombs_left = int(prev_players[my_id][3])
-        next_bombs_left = int(next_players[my_id][3])
-        reward += 0.08 * max(0, next_bombs_left - prev_bombs_left)
+        # Item pickup: if we moved onto an item tile and it disappeared.
+        next_pos = (int(next_players[my_id][0]), int(next_players[my_id][1]))
+        if 0 <= next_pos[0] < prev_map.shape[0] and 0 <= next_pos[1] < prev_map.shape[1]:
+            prev_cell = int(prev_map[next_pos[0], next_pos[1]])
+            next_cell = int(next_map[next_pos[0], next_pos[1]])
+            if prev_cell in (3, 4) and next_cell == 0:
+                # Capacity items are slightly more valuable because they unlock more tempo.
+                reward += 0.12 if prev_cell == 4 else 0.08
 
+    # Kill signal: strong but not overwhelming.
     prev_enemy_alive = int(np.sum(prev_players[:, 2])) if len(prev_players) else 0
     next_enemy_alive = int(np.sum(next_players[:, 2])) if len(next_players) else 0
     if my_id < len(prev_players):
         prev_enemy_alive -= int(prev_players[my_id][2])
     if my_id < len(next_players):
         next_enemy_alive -= int(next_players[my_id][2])
-    reward += 1.0 * max(0, prev_enemy_alive - next_enemy_alive)
+    enemy_kills = max(0, prev_enemy_alive - next_enemy_alive)
+    reward += 0.8 * enemy_kills
 
-    prev_boxes = int(np.sum(prev_obs["map"] == 2))
-    next_boxes = int(np.sum(next_obs["map"] == 2))
-    reward += 0.05 * max(0, prev_boxes - next_boxes)
+    # Box destruction: useful, but should not dominate the game.
+    prev_boxes = int(np.sum(prev_map == 2))
+    next_boxes = int(np.sum(next_map == 2))
+    boxes_destroyed = max(0, prev_boxes - next_boxes)
+    reward += 0.015 * boxes_destroyed
 
+    # Bomb placement: encourage only safe / meaningful bombs.
     if action == 5:
-        reward -= 0.01
+        if my_id < len(prev_players) and int(prev_players[my_id][2]) == 1:
+            my_pos = (int(prev_players[my_id][0]), int(prev_players[my_id][1]))
+            if should_place_bomb_here(prev_map, prev_players, prev_obs["bombs"], my_id, my_pos):
+                reward += 0.01
+            else:
+                reward -= 0.05
+        else:
+            reward -= 0.02
 
+    # Light anti-stalling pressure.
+    reward -= 0.002
+
+    # Terminal reward dominates the episode.
     if terminated or truncated:
         if my_id < len(next_players) and int(next_players[my_id][2]) == 1:
             alive_count = int(np.sum(next_players[:, 2]))
             if alive_count == 1:
-                reward += 4.0
+                reward += 6.0
             else:
-                reward += 1.0
+                # Alive at the end is good; being one of the last survivors is better.
+                reward += 1.25 + 0.25 * max(0, 4 - alive_count)
+        else:
+            reward -= 2.0
 
-    return float(np.clip(reward, -5.0, 5.0))
+    return float(np.clip(reward, -8.0, 8.0))
 
 
 # -----------------------------------------------------------------------------
@@ -2526,10 +2549,10 @@ def main():
     ensure_dir(TRAIN_DIR)
     ensure_dir(VAL_DIR)
 
-    # if BASELINE_IMPORT_ERRORS:
-    #     print("Some baseline imports failed; trainer will use fallback rules where needed.", flush=True)
-    #     for name, err in BASELINE_IMPORT_ERRORS:
-    #         print(f"  - {name}: {err}", flush=True)
+    if BASELINE_IMPORT_ERRORS:
+        print("Some baseline imports failed; trainer will use fallback rules where needed.", flush=True)
+        for name, err in BASELINE_IMPORT_ERRORS:
+            print(f"  - {name}: {err}", flush=True)
 
     # print("=== Phase 1: Collect initial demonstrations ===", flush=True)
     # collect_initial_data(TRAIN_DIR, VAL_DIR, INITIAL_GAMES)
@@ -2543,11 +2566,10 @@ def main():
 
     # print("=== Phase 4: Refresh BC after DAgger ===", flush=True)
     # model = train_policy_model(TRAIN_DIR, VAL_DIR, init_model_path=MODEL_PATH, lr=FINE_TUNE_LR)
-    
-    model = BomberNet(INPUT_CHANNELS).to(DEVICE)
+    # model = BomberNet(INPUT_CHANNELS).to(DEVICE)
 
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    pretrained_path = os.path.join(current_dir, "model_bc.pth")
+    pretrained_path = os.path.join(current_dir, "model_bc_best.pth")
     if os.path.exists(pretrained_path):
         state = torch.load(pretrained_path, map_location=DEVICE)
         model.load_state_dict(state, strict=False)
@@ -2560,9 +2582,13 @@ def main():
     for round_idx in range(RL_ROUNDS):
         frozen = copy.deepcopy(model).to(DEVICE)
         frozen.eval()
+        
+        quick_eval_against_baselines(frozen, num_games=20)
+
         rollouts = collect_selfplay_rollouts(model, frozen_model=frozen, num_games=ROLLOUT_GAMES_PER_ROUND)
         print(f"Round {round_idx + 1}: collected {len(rollouts)} episodes", flush=True)
         model = ppo_finetune(model, rollouts, bc_mix_dir=TRAIN_DIR)
+        
 
     print("=== Optional quick sanity check ===", flush=True)
     quick_eval_against_baselines(model, num_games=20)
