@@ -1106,6 +1106,7 @@ def build_opponents(controlled_id: int, game_seed: int) -> Dict[int, object]:
     rng  = random.Random(game_seed)
     pool = [cls for cls in [TacticalRuleAgent, GeniusRuleAgent, SmarterRuleAgent] if cls is not None]
     if not pool:
+        raise ImportError("No baseline agents available; check imports and fallback.")
         pool = [_FallbackRuleAgent]
     other_ids = [pid for pid in range(4) if pid != controlled_id]
     return {pid: rng.choice(pool)(pid) for pid in other_ids}
