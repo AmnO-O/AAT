@@ -1682,9 +1682,9 @@ import copy
 from torch.distributions import Categorical
 
 # Training knobs for the actor-critic stage.
-RL_ROUNDS = 3
-ROLLOUT_GAMES_PER_ROUND = 120
-PPO_EPOCHS = 4
+RL_ROUNDS = 10
+ROLLOUT_GAMES_PER_ROUND = 250
+PPO_EPOCHS = 6
 PPO_BATCH_SIZE = 256
 PPO_CLIP_EPS = 0.20
 PPO_GAMMA = 0.98
@@ -2581,7 +2581,7 @@ def main():
 
     model = BomberNet(INPUT_CHANNELS).to(DEVICE)
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    pretrained_path = os.path.join(current_dir, "model_bc.pth")
+    pretrained_path = os.path.join(current_dir, "model_bc_best.pth")
     if os.path.exists(pretrained_path):
         state = torch.load(pretrained_path, map_location=DEVICE)
         model.load_state_dict(state, strict=False)
