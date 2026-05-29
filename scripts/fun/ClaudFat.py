@@ -68,9 +68,10 @@ RandomAgent        = _try_import("RandomAgent",        "agent.random_agent",    
 
 # ===========================================================================
 # Configuration
+# Seed = 42, 142
 # ===========================================================================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-SEED   = 42
+SEED   = 142
 
 BOARD_SIZE            = 13
 INPUT_CHANNELS        = 27
@@ -123,7 +124,7 @@ PPO_LAMBDA              = 0.95  # FIX: now actually used in GAE
 PPO_VALUE_COEF          = 0.5
 PPO_ENTROPY_COEF        = 0.01
 PPO_MAX_GRAD_NORM       = 1.0
-BC_MIX_COEF             = 0.10
+BC_MIX_COEF             = 0.05
 LEAGUE_POOL_SIZE        = 6    # max past checkpoints kept for self-play
 
 
@@ -1840,18 +1841,30 @@ def main() -> None:
         for name, err in BASELINE_IMPORT_ERRORS:
             print(f"  {name}: {err}", flush=True)
 
-    print("=== Phase 1: BC data collection ===", flush=True)
-    collect_initial_data(TRAIN_DIR, VAL_DIR, INITIAL_GAMES)
+    # print("=== Phase 1: BC data collection ===", flush=True)
+    # collect_initial_data(TRAIN_DIR, VAL_DIR, INITIAL_GAMES)
 
-    print("=== Phase 2: BC policy/value training ===", flush=True)
-    model = train_policy_model(TRAIN_DIR, VAL_DIR, lr=LEARNING_RATE)
+    # print("=== Phase 2: BC policy/value training ===", flush=True)
+    # model = train_policy_model(TRAIN_DIR, VAL_DIR, lr=LEARNING_RATE)
 
-    print("=== Phase 3: DAgger correction ===", flush=True)
-    n = collect_dagger_data(model, TRAIN_DIR, MIXED_DAGGER_GAMES)
-    print(f"DAgger collected {n} corrective samples", flush=True)
+    # print("=== Phase 3: DAgger correction ===", flush=True)
+    # n = collect_dagger_data(model, TRAIN_DIR, MIXED_DAGGER_GAMES)
+    # print(f"DAgger collected {n} corrective samples", flush=True)
 
-    print("=== Phase 4: Refresh BC with aggregated data ===", flush=True)
-    model = train_policy_model(TRAIN_DIR, VAL_DIR, init_model_path=MODEL_PATH, lr=FINE_TUNE_LR)
+    # print("=== Phase 4: Refresh BC with aggregated data ===", flush=True)
+    # model = train_policy_model(TRAIN_DIR, VAL_DIR, init_model_path=MODEL_PATH, lr=FINE_TUNE_LR)
+
+    model = BomberNet(INPUT_CHANNELS).to(DEVICE)
+
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    pretrained_path = os.path.join(current_dir, "model_bc_best.pth")
+    if os.path.exists(pretrained_path):
+        state = torch.load(pretrained_path, map_location=DEVICE)
+        model.load_state_dict(state, strict=True)
+        print(f"Loaded pretrained weights from {pretrained_path}")
+    else:
+        raise FileNotFoundError(f"Can't find {pretrained_path}")
+
 
     print("=== Phase 5: PPO self-play fine-tuning ===", flush=True)
     league = LeaguePool(max_size=LEAGUE_POOL_SIZE)
