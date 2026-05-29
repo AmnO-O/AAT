@@ -1935,12 +1935,17 @@ def compute_shaped_reward(
     truncated: bool,
 ) -> float:
     """
-    Contest-aligned shaping:
-      - keep per-step rewards small,
-      - make terminal outcome dominate,
-      - reward only productive bombs / box breaking / item pickups.
+    Contest-aligned shaping.
+
+    Design goals:
+      - terminal outcome must dominate;
+      - survival should help, but not become the main objective;
+      - kills should matter more than boxes;
+      - boxes and items should matter, but stay below kill / win signals;
+      - unsafe bombs should be discouraged hard enough that the policy does not
+        learn to suicide for tiny short-term gain.
     """
-    reward = 0.005  # small living reward
+    reward = 0.002  # tiny living reward
 
     prev_players = prev_obs["players"]
     next_players = next_obs["players"]
@@ -1953,26 +1958,25 @@ def compute_shaped_reward(
 
         # Survival / death signal.
         if prev_alive == 1 and next_alive == 1:
-            reward += 0.005
+            reward += 0.002
         elif prev_alive == 1 and next_alive == 0:
-            reward -= 4.0
+            reward -= 5.0
 
         # Radius item: directly observable from the bonus delta.
         prev_bonus = int(prev_players[my_id][4])
         next_bonus = int(next_players[my_id][4])
         if next_bonus > prev_bonus:
-            reward += 0.10 * (next_bonus - prev_bonus)
+            reward += 0.08 * (next_bonus - prev_bonus)
 
-        # Item pickup: if we moved onto an item tile and it disappeared.
+        # Item pickup: capacity is slightly more valuable because it unlocks tempo.
         next_pos = (int(next_players[my_id][0]), int(next_players[my_id][1]))
         if 0 <= next_pos[0] < prev_map.shape[0] and 0 <= next_pos[1] < prev_map.shape[1]:
             prev_cell = int(prev_map[next_pos[0], next_pos[1]])
             next_cell = int(next_map[next_pos[0], next_pos[1]])
             if prev_cell in (3, 4) and next_cell == 0:
-                # Capacity items are slightly more valuable because they unlock more tempo.
-                reward += 0.12 if prev_cell == 4 else 0.08
+                reward += 0.08 if prev_cell == 4 else 0.05
 
-    # Kill signal: strong but not overwhelming.
+    # Kill signal: strong, and even stronger in the late game.
     prev_enemy_alive = int(np.sum(prev_players[:, 2])) if len(prev_players) else 0
     next_enemy_alive = int(np.sum(next_players[:, 2])) if len(next_players) else 0
     if my_id < len(prev_players):
@@ -1980,41 +1984,48 @@ def compute_shaped_reward(
     if my_id < len(next_players):
         next_enemy_alive -= int(next_players[my_id][2])
     enemy_kills = max(0, prev_enemy_alive - next_enemy_alive)
-    reward += 0.8 * enemy_kills
+    if enemy_kills > 0:
+        kill_bonus = 1.0
+        if next_enemy_alive <= 1:
+            kill_bonus += 0.5
+        reward += kill_bonus * enemy_kills
 
     # Box destruction: useful, but should not dominate the game.
     prev_boxes = int(np.sum(prev_map == 2))
     next_boxes = int(np.sum(next_map == 2))
     boxes_destroyed = max(0, prev_boxes - next_boxes)
-    reward += 0.015 * boxes_destroyed
+    if boxes_destroyed > 0:
+        reward += 0.02 * boxes_destroyed
+        if boxes_destroyed >= 2:
+            reward += 0.01 * (boxes_destroyed - 1)
 
     # Bomb placement: encourage only safe / meaningful bombs.
     if action == 5:
         if my_id < len(prev_players) and int(prev_players[my_id][2]) == 1:
             my_pos = (int(prev_players[my_id][0]), int(prev_players[my_id][1]))
             if should_place_bomb_here(prev_map, prev_players, prev_obs["bombs"], my_id, my_pos):
-                reward += 0.01
+                reward += 0.02
             else:
-                reward -= 0.05
+                reward -= 0.15
         else:
-            reward -= 0.02
+            reward -= 0.03
 
-    # Light anti-stalling pressure.
-    reward -= 0.002
+    # Light anti-stalling pressure. This stays small so it does not overpower the game.
+    reward -= 0.003
 
     # Terminal reward dominates the episode.
     if terminated or truncated:
         if my_id < len(next_players) and int(next_players[my_id][2]) == 1:
             alive_count = int(np.sum(next_players[:, 2]))
             if alive_count == 1:
-                reward += 6.0
+                reward += 8.0
             else:
-                # Alive at the end is good; being one of the last survivors is better.
-                reward += 1.25 + 0.25 * max(0, 4 - alive_count)
+                # Surviving to the end is good, but much less important than winning.
+                reward += 0.35 + 0.10 * max(0, 4 - alive_count)
         else:
-            reward -= 2.0
+            reward -= 1.5
 
-    return float(np.clip(reward, -8.0, 8.0))
+    return float(np.clip(reward, -10.0, 10.0))
 
 
 # -----------------------------------------------------------------------------
@@ -2566,7 +2577,8 @@ def main():
 
     # print("=== Phase 4: Refresh BC after DAgger ===", flush=True)
     # model = train_policy_model(TRAIN_DIR, VAL_DIR, init_model_path=MODEL_PATH, lr=FINE_TUNE_LR)
-    
+
+
     model = BomberNet(INPUT_CHANNELS).to(DEVICE)
     current_dir = os.path.dirname(os.path.abspath(__file__))
     pretrained_path = os.path.join(current_dir, "model_bc.pth")
@@ -2577,18 +2589,16 @@ def main():
     else:
         raise FileNotFoundError(f"Can't find {pretrained_path}")
 
-
     print("=== Phase 5: Self-play actor-critic fine-tuning ===", flush=True)
     for round_idx in range(RL_ROUNDS):
         frozen = copy.deepcopy(model).to(DEVICE)
         frozen.eval()
-
+        
         quick_eval_against_baselines(frozen, num_games=20)
-
+        
         rollouts = collect_selfplay_rollouts(model, frozen_model=frozen, num_games=ROLLOUT_GAMES_PER_ROUND)
         print(f"Round {round_idx + 1}: collected {len(rollouts)} episodes", flush=True)
         model = ppo_finetune(model, rollouts, bc_mix_dir=TRAIN_DIR)
-        
 
     print("=== Optional quick sanity check ===", flush=True)
     quick_eval_against_baselines(model, num_games=20)
