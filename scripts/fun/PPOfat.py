@@ -2566,8 +2566,8 @@ def main():
 
     # print("=== Phase 4: Refresh BC after DAgger ===", flush=True)
     # model = train_policy_model(TRAIN_DIR, VAL_DIR, init_model_path=MODEL_PATH, lr=FINE_TUNE_LR)
-    # model = BomberNet(INPUT_CHANNELS).to(DEVICE)
-
+    
+    model = BomberNet(INPUT_CHANNELS).to(DEVICE)
     current_dir = os.path.dirname(os.path.abspath(__file__))
     pretrained_path = os.path.join(current_dir, "model_bc_best.pth")
     if os.path.exists(pretrained_path):
@@ -2582,7 +2582,7 @@ def main():
     for round_idx in range(RL_ROUNDS):
         frozen = copy.deepcopy(model).to(DEVICE)
         frozen.eval()
-        
+
         quick_eval_against_baselines(frozen, num_games=20)
 
         rollouts = collect_selfplay_rollouts(model, frozen_model=frozen, num_games=ROLLOUT_GAMES_PER_ROUND)
