@@ -114,7 +114,7 @@ MANIFEST_NAME  = "manifest.json"
 AUGMENT_FLIP_PROB = 0.5  # FIX: was 1.0 — original orientation now also trained on
 
 # --- PPO / self-play
-RL_ROUNDS               = 7    # was 3
+RL_ROUNDS               = 8    # was 3
 ROLLOUT_GAMES_PER_ROUND = 200  # was 120
 PPO_EPOCHS              = 6    # was 4
 PPO_BATCH_SIZE          = 256
