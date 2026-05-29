@@ -1682,17 +1682,17 @@ import copy
 from torch.distributions import Categorical
 
 # Training knobs for the actor-critic stage.
-RL_ROUNDS = 10
-ROLLOUT_GAMES_PER_ROUND = 250
-PPO_EPOCHS = 6
+RL_ROUNDS = 6
+ROLLOUT_GAMES_PER_ROUND = 200
+PPO_EPOCHS = 4
 PPO_BATCH_SIZE = 256
 PPO_CLIP_EPS = 0.20
 PPO_GAMMA = 0.98
 PPO_LAMBDA = 0.95
 PPO_VALUE_COEF = 0.5
-PPO_ENTROPY_COEF = 0.01
+PPO_ENTROPY_COEF = 0.03   # giảm dần sau 2 vòng về 0.01
 PPO_MAX_GRAD_NORM = 1.0
-BC_MIX_COEF = 0.15
+BC_MIX_COEF = 0.10        # giảm dần về 0.05 → 0.02 → 0
 MIXED_DAGGER_GAMES = 120
 
 # -----------------------------------------------------------------------------
@@ -2524,16 +2524,37 @@ def quick_eval_against_baselines(model: nn.Module, num_games: int = 20) -> None:
         while not done:
             if controlled_id >= len(obs["players"]) or int(obs["players"][controlled_id][2]) != 1:
                 break
+
             state = encode_obs(obs["map"], obs["players"], obs["bombs"], controlled_id, step).unsqueeze(0).to(DEVICE)
             my_pos = (int(obs["players"][controlled_id][0]), int(obs["players"][controlled_id][1]))
             bombs_left = int(obs["players"][controlled_id][3])
+
+            # Legal action mask
             legal_mask = _legal_action_mask(obs["map"], obs["bombs"], my_pos, bombs_left)
+
+            # Shielded mask – just like in training rollouts
+            shielded_mask = _shielded_legal_mask(
+                obs["map"],
+                obs["players"],
+                obs["bombs"],
+                controlled_id,
+                legal_mask,
+            )
+
+            # Choose action deterministically (argmax) but respecting shielded mask
             with torch.no_grad():
-                action, _, _, _ = _sample_masked_action(model, state, legal_mask=legal_mask, sample=False)
+                action, _, _, _ = _sample_masked_action(
+                    model,
+                    state,
+                    legal_mask=shielded_mask,   # sử dụng shielded mask
+                    sample=False,
+                )
+
             actions = [0, 0, 0, 0]
             actions[controlled_id] = action
             for pid, agent in opponents.items():
                 actions[pid] = int(agent.act(obs))
+
             obs, terminated, truncated = env.step(actions)
             done = bool(terminated or truncated)
             step += 1
@@ -2551,8 +2572,6 @@ def quick_eval_against_baselines(model: nn.Module, num_games: int = 20) -> None:
 
     avg_steps = total_survival_steps / max(1, num_games)
     print(f"Quick eval proxy | wins={wins} draws={draws} losses={losses} | avg_survival_steps={avg_steps:.1f}", flush=True)
-
-
 # -----------------------------------------------------------------------------
 # Main override
 # -----------------------------------------------------------------------------
@@ -2581,7 +2600,7 @@ def main():
 
     model = BomberNet(INPUT_CHANNELS).to(DEVICE)
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    pretrained_path = os.path.join(current_dir, "model_bc_best.pth")
+    pretrained_path = os.path.join(current_dir, "model_bc.pth")
     if os.path.exists(pretrained_path):
         state = torch.load(pretrained_path, map_location=DEVICE)
         model.load_state_dict(state, strict=False)
