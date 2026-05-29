@@ -124,7 +124,7 @@ PPO_LAMBDA              = 0.95  # FIX: now actually used in GAE
 PPO_VALUE_COEF          = 0.5
 PPO_ENTROPY_COEF        = 0.01
 PPO_MAX_GRAD_NORM       = 1.0
-BC_MIX_COEF             = 0.03
+BC_MIX_COEF             = 0.04
 LEAGUE_POOL_SIZE        = 2    # max past checkpoints kept for self-play
 
 
@@ -1104,8 +1104,7 @@ def build_opponents(controlled_id: int, game_seed: int) -> Dict[int, object]:
          for more diverse training states.
     """
     rng  = random.Random(game_seed)
-    pool = [cls for cls in [TacticalRuleAgent, GeniusRuleAgent, SmarterRuleAgent,
-                             BoxFarmerAgent, SimpleRuleAgent] if cls is not None]
+    pool = [cls for cls in [TacticalRuleAgent, GeniusRuleAgent, SmarterRuleAgent] if cls is not None]
     if not pool:
         pool = [_FallbackRuleAgent]
     other_ids = [pid for pid in range(4) if pid != controlled_id]
