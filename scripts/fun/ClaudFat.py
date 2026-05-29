@@ -114,7 +114,7 @@ MANIFEST_NAME  = "manifest.json"
 AUGMENT_FLIP_PROB = 0.5  # FIX: was 1.0 — original orientation now also trained on
 
 # --- PPO / self-play
-RL_ROUNDS               = 6    # was 3
+RL_ROUNDS               = 7    # was 3
 ROLLOUT_GAMES_PER_ROUND = 200  # was 120
 PPO_EPOCHS              = 6    # was 4
 PPO_BATCH_SIZE          = 256
@@ -124,7 +124,7 @@ PPO_LAMBDA              = 0.95  # FIX: now actually used in GAE
 PPO_VALUE_COEF          = 0.5
 PPO_ENTROPY_COEF        = 0.01
 PPO_MAX_GRAD_NORM       = 1.0
-BC_MIX_COEF             = 0.05
+BC_MIX_COEF             = 0.03
 LEAGUE_POOL_SIZE        = 6    # max past checkpoints kept for self-play
 
 
@@ -1185,8 +1185,7 @@ def build_selfplay_opponents(
     This gives the learner diverse opponents within a single game.
     """
     rng = random.Random(game_seed)
-    base_pool = [cls for cls in [TacticalRuleAgent, GeniusRuleAgent, SmarterRuleAgent,
-                                  BoxFarmerAgent, SimpleRuleAgent, RandomAgent]
+    base_pool = [cls for cls in [TacticalRuleAgent, GeniusRuleAgent, SmarterRuleAgent]
                  if cls is not None] or [_FallbackRuleAgent]
     opponents: Dict[int, object] = {}
     for pid in [p for p in range(4) if p != controlled_id]:
