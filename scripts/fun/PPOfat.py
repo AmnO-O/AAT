@@ -2603,7 +2603,7 @@ def main():
     pretrained_path = os.path.join(current_dir, "model_bc.pth")
     if os.path.exists(pretrained_path):
         state = torch.load(pretrained_path, map_location=DEVICE)
-        model.load_state_dict(state, strict=False)
+        model.load_state_dict(state, strict=True)
         print(f"Loaded pretrained weights from {pretrained_path}")
     else:
         raise FileNotFoundError(f"Can't find {pretrained_path}")
