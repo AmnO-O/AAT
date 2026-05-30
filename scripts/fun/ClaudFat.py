@@ -68,9 +68,10 @@ RandomAgent        = _try_import("RandomAgent",        "agent.random_agent",    
 
 # ===========================================================================
 # Configuration
+# Seed = 42, 142
 # ===========================================================================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-SEED   = 42
+SEED   = 142
 
 BOARD_SIZE            = 13
 INPUT_CHANNELS        = 27
@@ -93,7 +94,7 @@ N_SCALAR  = len(SCALAR_CHANNELS)   # 7
 
 # --- BC / DAgger
 INITIAL_GAMES       = 800
-MIXED_DAGGER_GAMES  = 200
+MIXED_DAGGER_GAMES  = 250
 TRAIN_SPLIT_MOD     = 10     # seed % 10 == 0 → validation
 CHUNK_SIZE          = 2048
 BATCH_SIZE          = 128
@@ -113,8 +114,8 @@ MANIFEST_NAME  = "manifest.json"
 AUGMENT_FLIP_PROB = 0.5  # FIX: was 1.0 — original orientation now also trained on
 
 # --- PPO / self-play
-RL_ROUNDS               = 5    # was 3
-ROLLOUT_GAMES_PER_ROUND = 200  # was 120
+RL_ROUNDS               = 8    # was 3
+ROLLOUT_GAMES_PER_ROUND = 250  # was 120
 PPO_EPOCHS              = 6    # was 4
 PPO_BATCH_SIZE          = 256
 PPO_CLIP_EPS            = 0.20
@@ -123,7 +124,7 @@ PPO_LAMBDA              = 0.95  # FIX: now actually used in GAE
 PPO_VALUE_COEF          = 0.5
 PPO_ENTROPY_COEF        = 0.01
 PPO_MAX_GRAD_NORM       = 1.0
-BC_MIX_COEF             = 0.10
+BC_MIX_COEF             = 0.05
 LEAGUE_POOL_SIZE        = 6    # max past checkpoints kept for self-play
 
 
@@ -1103,9 +1104,9 @@ def build_opponents(controlled_id: int, game_seed: int) -> Dict[int, object]:
          for more diverse training states.
     """
     rng  = random.Random(game_seed)
-    pool = [cls for cls in [TacticalRuleAgent, GeniusRuleAgent, SmarterRuleAgent,
-                             BoxFarmerAgent, SimpleRuleAgent] if cls is not None]
+    pool = [cls for cls in [TacticalRuleAgent, GeniusRuleAgent, SmarterRuleAgent, BoxFarmerAgent, SimpleRuleAgent] if cls is not None]
     if not pool:
+        raise ImportError("No baseline agents available; check imports and fallback.")
         pool = [_FallbackRuleAgent]
     other_ids = [pid for pid in range(4) if pid != controlled_id]
     return {pid: rng.choice(pool)(pid) for pid in other_ids}
@@ -1184,8 +1185,7 @@ def build_selfplay_opponents(
     This gives the learner diverse opponents within a single game.
     """
     rng = random.Random(game_seed)
-    base_pool = [cls for cls in [TacticalRuleAgent, GeniusRuleAgent, SmarterRuleAgent,
-                                  BoxFarmerAgent, SimpleRuleAgent, RandomAgent]
+    base_pool = [cls for cls in [TacticalRuleAgent, GeniusRuleAgent, SmarterRuleAgent]
                  if cls is not None] or [_FallbackRuleAgent]
     opponents: Dict[int, object] = {}
     for pid in [p for p in range(4) if p != controlled_id]:
@@ -1325,47 +1325,76 @@ def compute_shaped_reward(
 ) -> float:
     reward = 0.0
     prev_players, next_players = prev_obs["players"], next_obs["players"]
-    prev_map,     next_map     = prev_obs["map"],     next_obs["map"]
+    prev_map, next_map = prev_obs["map"], next_obs["map"]
 
     if my_id < len(prev_players) and my_id < len(next_players):
         prev_alive = int(prev_players[my_id][2])
         next_alive = int(next_players[my_id][2])
+
+        # Keep survival signal tiny so it does not dominate.
         if prev_alive == 1 and next_alive == 1:
-            reward += 0.001
+            reward += 0.0002
         elif prev_alive == 1 and next_alive == 0:
             reward -= 6.0
 
+        # Item pickup: useful, but not so large that the agent starts
+        # chasing items instead of playing the map.
         bonus_gain = max(0, int(next_players[my_id][4]) - int(prev_players[my_id][4]))
         if bonus_gain > 0:
-            reward += 0.04 * bonus_gain
+            reward += 0.05 * bonus_gain
 
         npos = (int(next_players[my_id][0]), int(next_players[my_id][1]))
         if 0 <= npos[0] < prev_map.shape[0] and 0 <= npos[1] < prev_map.shape[1]:
             prev_cell = int(prev_map[npos[0], npos[1]])
             next_cell = int(next_map[npos[0], npos[1]])
             if prev_cell in (3, 4) and next_cell == 0:
-                reward += 0.04 if prev_cell == 3 else 0.06
+                reward += 0.08 if prev_cell == 3 else 0.10
 
     prev_alive_e = int(np.sum(prev_players[:, 2])) - int(prev_players[my_id][2]) if my_id < len(prev_players) else 0
     next_alive_e = int(np.sum(next_players[:, 2])) - int(next_players[my_id][2]) if my_id < len(next_players) else 0
     kills = max(0, prev_alive_e - next_alive_e)
     if kills > 0:
-        bonus = 1.2 + (0.8 if next_alive_e <= 1 else 0.0)
+        # Slightly lower than before, but still the main positive terminal combat signal.
+        bonus = 0.9 + (0.3 if next_alive_e <= 1 else 0.0)
         reward += bonus * kills
 
     boxes_destroyed = max(0, int(np.sum(prev_map == 2)) - int(np.sum(next_map == 2)))
     if boxes_destroyed > 0:
-        reward += 0.01 * boxes_destroyed + (0.003 * (boxes_destroyed - 1) if boxes_destroyed >= 2 else 0.0)
+        # Enough to value map control, not enough to make the agent pure farmer.
+        reward += 0.03 * boxes_destroyed
+        if boxes_destroyed >= 2:
+            reward += 0.01 * (boxes_destroyed - 1)
 
     if action == 5 and my_id < len(prev_players) and int(prev_players[my_id][2]) == 1:
         my_pos = (int(prev_players[my_id][0]), int(prev_players[my_id][1]))
-        if should_place_bomb_here(prev_map, prev_players, prev_obs["bombs"], my_id, my_pos):
-            reward += 0.04
-        else:
-            # FIX: penalty was -0.20 (7:1 ratio); now -0.10 (~2.5:1) to avoid over-suppressing bombing
-            reward -= 0.10
 
-    reward -= 0.004  # anti-stalling
+        if should_place_bomb_here(prev_map, prev_players, prev_obs["bombs"], my_id, my_pos):
+            # Safe bombing should be meaningfully attractive.
+            reward += 0.10
+
+            bomb_radius = 1 + int(prev_players[my_id][4])
+            blast = blast_tiles(prev_map, my_pos[0], my_pos[1], bomb_radius)
+
+            # Immediate tactical value: boxes, enemy pressure, and chain acceleration.
+            hit_boxes = sum(1 for r, c in blast if int(prev_map[r, c]) == 2)
+            hit_enemies = sum(
+                1 for i in range(4)
+                if i != my_id and i < len(prev_players) and int(prev_players[i][2]) == 1
+                and (int(prev_players[i][0]), int(prev_players[i][1])) in blast
+            )
+
+            hyp_bombs = _add_hypothetical_bomb(prev_obs["bombs"], my_pos, my_id)
+            before = bomb_effective_explosion_times(prev_map, prev_players, prev_obs["bombs"])
+            after = bomb_effective_explosion_times(prev_map, prev_players, hyp_bombs)
+            chain_gain = float(np.sum(np.maximum(0, before - after))) if len(before) and len(after) else 0.0
+
+            reward += 0.015 * hit_boxes
+            reward += 0.08 * hit_enemies
+            reward += 0.004 * chain_gain
+        else:
+            reward -= 0.12
+
+    reward -= 0.001  # small anti-stall pressure
 
     if terminated or truncated:
         if my_id < len(next_players) and int(next_players[my_id][2]) == 1:
@@ -1840,18 +1869,30 @@ def main() -> None:
         for name, err in BASELINE_IMPORT_ERRORS:
             print(f"  {name}: {err}", flush=True)
 
-    print("=== Phase 1: BC data collection ===", flush=True)
-    collect_initial_data(TRAIN_DIR, VAL_DIR, INITIAL_GAMES)
+    # print("=== Phase 1: BC data collection ===", flush=True)
+    # collect_initial_data(TRAIN_DIR, VAL_DIR, INITIAL_GAMES)
 
-    print("=== Phase 2: BC policy/value training ===", flush=True)
-    model = train_policy_model(TRAIN_DIR, VAL_DIR, lr=LEARNING_RATE)
+    # print("=== Phase 2: BC policy/value training ===", flush=True)
+    # model = train_policy_model(TRAIN_DIR, VAL_DIR, lr=LEARNING_RATE)
 
-    print("=== Phase 3: DAgger correction ===", flush=True)
-    n = collect_dagger_data(model, TRAIN_DIR, MIXED_DAGGER_GAMES)
-    print(f"DAgger collected {n} corrective samples", flush=True)
+    # print("=== Phase 3: DAgger correction ===", flush=True)
+    # n = collect_dagger_data(model, TRAIN_DIR, MIXED_DAGGER_GAMES)
+    # print(f"DAgger collected {n} corrective samples", flush=True)
 
-    print("=== Phase 4: Refresh BC with aggregated data ===", flush=True)
-    model = train_policy_model(TRAIN_DIR, VAL_DIR, init_model_path=MODEL_PATH, lr=FINE_TUNE_LR)
+    # print("=== Phase 4: Refresh BC with aggregated data ===", flush=True)
+    # model = train_policy_model(TRAIN_DIR, VAL_DIR, init_model_path=MODEL_PATH, lr=FINE_TUNE_LR)
+
+    model = BomberNet(INPUT_CHANNELS).to(DEVICE)
+
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    pretrained_path = os.path.join(current_dir, "model_bc.pth")
+    if os.path.exists(pretrained_path):
+        state = torch.load(pretrained_path, map_location=DEVICE)
+        model.load_state_dict(state, strict=True)
+        print(f"Loaded pretrained weights from {pretrained_path}")
+    else:
+        raise FileNotFoundError(f"Can't find {pretrained_path}")
+
 
     print("=== Phase 5: PPO self-play fine-tuning ===", flush=True)
     league = LeaguePool(max_size=LEAGUE_POOL_SIZE)
