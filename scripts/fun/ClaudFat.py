@@ -115,7 +115,7 @@ AUGMENT_FLIP_PROB = 0.5  # FIX: was 1.0 — original orientation now also traine
 
 # --- PPO / self-play
 RL_ROUNDS               = 8    # was 3
-ROLLOUT_GAMES_PER_ROUND = 200  # was 120
+ROLLOUT_GAMES_PER_ROUND = 250  # was 120
 PPO_EPOCHS              = 6    # was 4
 PPO_BATCH_SIZE          = 256
 PPO_CLIP_EPS            = 0.20
