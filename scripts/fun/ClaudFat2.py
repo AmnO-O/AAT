@@ -1993,11 +1993,11 @@ def main() -> None:
         for name, err in BASELINE_IMPORT_ERRORS:
             print(f"  {name}: {err}", flush=True)
 
-    # print("=== Phase 1: BC data collection ===", flush=True)
-    # collect_initial_data(TRAIN_DIR, VAL_DIR, INITIAL_GAMES)
+    print("=== Phase 1: BC data collection ===", flush=True)
+    collect_initial_data(TRAIN_DIR, VAL_DIR, INITIAL_GAMES)
 
-    # print("=== Phase 2: BC policy/value training ===", flush=True)
-    # model = train_policy_model(TRAIN_DIR, VAL_DIR, lr=LEARNING_RATE)
+    print("=== Phase 2: BC policy/value training ===", flush=True)
+    model = train_policy_model(TRAIN_DIR, VAL_DIR, lr=LEARNING_RATE)
 
     model = BomberNet(INPUT_CHANNELS).to(DEVICE)
 
