@@ -1999,14 +1999,6 @@ def main() -> None:
     # print("=== Phase 2: BC policy/value training ===", flush=True)
     # model = train_policy_model(TRAIN_DIR, VAL_DIR, lr=LEARNING_RATE)
 
-    # print("=== Phase 3: DAgger correction ===", flush=True)
-    # n = collect_dagger_data(model, TRAIN_DIR, MIXED_DAGGER_GAMES)
-    # print(f"DAgger collected {n} corrective samples", flush=True)
-
-    # print("=== Phase 4: Refresh BC with aggregated data ===", flush=True)
-    # model = train_policy_model(TRAIN_DIR, VAL_DIR, init_model_path=MODEL_PATH, lr=FINE_TUNE_LR)
-
-    
     model = BomberNet(INPUT_CHANNELS).to(DEVICE)
 
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -2017,6 +2009,26 @@ def main() -> None:
         print(f"Loaded pretrained weights from {pretrained_path}")
     else:
         raise FileNotFoundError(f"Can't find {pretrained_path}")
+
+
+    print("=== Phase 3: DAgger correction ===", flush=True)
+    n = collect_dagger_data(model, TRAIN_DIR, MIXED_DAGGER_GAMES)
+    print(f"DAgger collected {n} corrective samples", flush=True)
+
+    print("=== Phase 4: Refresh BC with aggregated data ===", flush=True)
+    model = train_policy_model(TRAIN_DIR, VAL_DIR, init_model_path=MODEL_PATH, lr=FINE_TUNE_LR)
+
+    
+    # model = BomberNet(INPUT_CHANNELS).to(DEVICE)
+
+    # current_dir = os.path.dirname(os.path.abspath(__file__))
+    # pretrained_path = os.path.join(current_dir, "model_bc_best.pth")
+    # if os.path.exists(pretrained_path):
+    #     state = torch.load(pretrained_path, map_location=DEVICE)
+    #     model.load_state_dict(state, strict=True)
+    #     print(f"Loaded pretrained weights from {pretrained_path}")
+    # else:
+    #     raise FileNotFoundError(f"Can't find {pretrained_path}")
 
     print("=== Phase 5: PPO self-play fine-tuning ===", flush=True)
     league = LeaguePool(max_size=LEAGUE_POOL_SIZE)
