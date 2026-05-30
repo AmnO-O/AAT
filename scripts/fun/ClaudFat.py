@@ -94,7 +94,7 @@ N_SCALAR  = len(SCALAR_CHANNELS)   # 7
 
 # --- BC / DAgger
 INITIAL_GAMES       = 800
-MIXED_DAGGER_GAMES  = 200
+MIXED_DAGGER_GAMES  = 250
 TRAIN_SPLIT_MOD     = 10     # seed % 10 == 0 → validation
 CHUNK_SIZE          = 2048
 BATCH_SIZE          = 128
