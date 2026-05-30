@@ -1394,7 +1394,7 @@ def compute_shaped_reward(
         else:
             reward -= 0.12
 
-    reward -= 0.003  # small anti-stall pressure
+    reward -= 0.001  # small anti-stall pressure
 
     if terminated or truncated:
         if my_id < len(next_players) and int(next_players[my_id][2]) == 1:
