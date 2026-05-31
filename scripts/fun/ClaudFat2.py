@@ -2053,7 +2053,7 @@ def main() -> None:
     if best_ppo_state is not None:
         print(f"Restoring best PPO model (wr={best_ppo_wr:.3f})", flush=True)
         model.load_state_dict(best_ppo_state)
-        torch.save(model.state_dict(), MODEL_PATH)
+        #torch.save(model.state_dict(), MODEL_PATH)
 
     print("=== Final evaluation ===", flush=True)
     quick_eval_against_baselines(model, num_games=50)
