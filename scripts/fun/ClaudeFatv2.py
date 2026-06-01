@@ -139,7 +139,7 @@ MANIFEST_NAME   = "manifest.json"
 AUGMENT_FLIP_PROB = 0.5
 
 # --- PPO / self-play
-RL_ROUNDS               = 10
+RL_ROUNDS               = 20
 ROLLOUT_GAMES_PER_ROUND = 300   # raised from 250
 PPO_EPOCHS              = 6
 PPO_BATCH_SIZE          = 256
