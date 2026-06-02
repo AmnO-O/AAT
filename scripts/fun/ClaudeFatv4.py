@@ -181,8 +181,8 @@ GRAD_CLIP_NORM      = 1.0
 
 TRAIN_DIR       = "bc_train_chunks"
 VAL_DIR         = "bc_val_chunks"
-MODEL_PATH      = "model_bc.pth"
-BEST_MODEL_PATH = "model_bc_best.pth"
+MODEL_PATH      = "model_bc_.pth"
+BEST_MODEL_PATH = "model_bc_best_.pth"
 MANIFEST_NAME   = "manifest.json"
 
 AUGMENT_FLIP_PROB = 0.5
