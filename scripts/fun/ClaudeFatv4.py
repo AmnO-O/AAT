@@ -2310,7 +2310,7 @@ def main() -> None:
     
     model = BomberNet(INPUT_CHANNELS).to(DEVICE)
     current_dir     = os.path.dirname(os.path.abspath(__file__))
-    pretrained_path = os.path.join(current_dir, "model_best_ppo.pth")
+    pretrained_path = os.path.join(current_dir, "model_bc_.pth")
 
     # FIX v6: graceful weight loading — if checkpoint is missing or has wrong
     # shape (e.g. old 4×4-pool architecture), fall back to random init and
