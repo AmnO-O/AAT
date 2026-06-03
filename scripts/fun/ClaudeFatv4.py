@@ -2242,11 +2242,15 @@ def quick_eval_against_baselines(
             my_pos = (int(obs["players"][cid][0]), int(obs["players"][cid][1]))
             bl     = int(obs["players"][cid][3])
             lm     = _legal_action_mask(obs["map"], obs["bombs"], my_pos, bl)
-            shield = _shielded_legal_mask(   # eval keeps shield for safe deployment
-                obs["map"], obs["players"], obs["bombs"], cid, lm
-            )
-            with torch.no_grad():
-                action, _, _, _ = _sample_masked_action(model, state, shield, sample=False)
+           
+            # shield = _shielded_legal_mask(   # eval keeps shield for safe deployment
+            #     obs["map"], obs["players"], obs["bombs"], cid, lm
+            # )
+            # with torch.no_grad():
+            #     action, _, _, _ = _sample_masked_action(model, state, shield, sample=False)
+            
+            action, _, _, _ = _sample_masked_action(model, state, lm, sample=True)
+
 
             prev_e = sum(int(obs["players"][i][2]) for i in range(4) if i != cid)
             acts   = [0, 0, 0, 0]; acts[cid] = action
