@@ -2303,8 +2303,8 @@ def main() -> None:
     # print("=== Phase 4: Refresh BC with aggregated data ===", flush=True)
     # model = train_policy_model(TRAIN_DIR, VAL_DIR, init_model_path=MODEL_PATH, lr=FINE_TUNE_LR)
 
-    # model = BomberNet(INPUT_CHANNELS).to(DEVICE)
-
+    
+    model = BomberNet(INPUT_CHANNELS).to(DEVICE)
     current_dir     = os.path.dirname(os.path.abspath(__file__))
     pretrained_path = os.path.join(current_dir, "model_bc_best_.pth")
 
