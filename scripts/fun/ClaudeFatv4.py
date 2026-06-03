@@ -2345,7 +2345,7 @@ def main() -> None:
     best_wins = -1
     best_path = os.path.join(current_dir, "model_best_ppo.pth")  # FIX v6: track best
 
-    for round_idx in range(RL_ROUNDS):
+    for round_idx in range(30, RL_ROUNDS):
         # FIX v6: per-round LR decay — gentle cosine-like warmdown keeps
         # updates stable as the policy matures. 3e-4 → ~1.8e-4 at round 100.
         round_lr = FINE_TUNE_LR * (0.995 ** round_idx)
