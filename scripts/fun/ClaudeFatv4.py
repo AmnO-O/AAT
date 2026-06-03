@@ -2293,20 +2293,20 @@ def main() -> None:
     # Uncomment to re-run BC phases (recommended before a fresh full run):
     # print("=== Phase 1: BC data collection ===", flush=True)
     # collect_initial_data(TRAIN_DIR, VAL_DIR, INITIAL_GAMES)
-    print("=== Phase 2: BC policy/value training ===", flush=True)
-    model = train_policy_model(TRAIN_DIR, VAL_DIR, lr=LEARNING_RATE)
+    # print("=== Phase 2: BC policy/value training ===", flush=True)
+    # model = train_policy_model(TRAIN_DIR, VAL_DIR, lr=LEARNING_RATE)
 
-    print("=== Phase 3: DAgger correction ===", flush=True)
-    n = collect_dagger_data(model, TRAIN_DIR, MIXED_DAGGER_GAMES)
-    print(f"DAgger collected {n} corrective samples", flush=True)
+    # print("=== Phase 3: DAgger correction ===", flush=True)
+    # n = collect_dagger_data(model, TRAIN_DIR, MIXED_DAGGER_GAMES)
+    # print(f"DAgger collected {n} corrective samples", flush=True)
     
-    print("=== Phase 4: Refresh BC with aggregated data ===", flush=True)
-    model = train_policy_model(TRAIN_DIR, VAL_DIR, init_model_path=MODEL_PATH, lr=FINE_TUNE_LR)
+    # print("=== Phase 4: Refresh BC with aggregated data ===", flush=True)
+    # model = train_policy_model(TRAIN_DIR, VAL_DIR, init_model_path=MODEL_PATH, lr=FINE_TUNE_LR)
 
-    model = BomberNet(INPUT_CHANNELS).to(DEVICE)
+    # model = BomberNet(INPUT_CHANNELS).to(DEVICE)
 
     current_dir     = os.path.dirname(os.path.abspath(__file__))
-    pretrained_path = os.path.join(current_dir, "model_bc.pth")
+    pretrained_path = os.path.join(current_dir, "model_bc_best_.pth")
 
     # FIX v6: graceful weight loading — if checkpoint is missing or has wrong
     # shape (e.g. old 4×4-pool architecture), fall back to random init and
