@@ -2382,6 +2382,7 @@ def main() -> None:
             best_wins = wins
             torch.save(model.state_dict(), best_path)
             print(f"  ★ New best: {wins} wins — saved to {best_path}", flush=True)
+        torch.save(model.state_dict(), MODEL_PATH)  # save latest after every round
 
     print("=== Final evaluation ===", flush=True)
     quick_eval_against_baselines(model, num_games=50)
