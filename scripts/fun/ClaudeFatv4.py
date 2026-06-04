@@ -1354,17 +1354,17 @@ def build_selfplay_opponents(
     opponents: Dict[int, object] = {}
     for pid in [p for p in range(4) if p != controlled_id]:
         r = rng.random()
-        if r < 0.40 and frozen_model is not None:           # 40% frozen current
+        if r < 0.05 and frozen_model is not None:           # 5% frozen current
             fp = FrozenPolicyAgent(pid, frozen_model, deterministic=rng.random() < 0.7)
             fp.reset()
             opponents[pid] = fp
-        elif r < 0.60 and league_pool is not None and league_pool.snapshots:  # 20% league
+        elif r < 0.10 and league_pool is not None and league_pool.snapshots:  # 5% league
             # FIX v6: do NOT call .to(DEVICE) — keep model on its own device
             lm = league_pool.sample()
             fp = FrozenPolicyAgent(pid, lm, deterministic=rng.random() < 0.5)
             fp.reset()
             opponents[pid] = fp
-        else:                                                # 40% strong baselines
+        else:                                                # 90% strong baselines
             opponents[pid] = rng.choice(base_pool)(pid)
     return opponents
 
@@ -1501,7 +1501,7 @@ def compute_shaped_reward(
         if prev_alive == 1 and next_alive == 1:
             reward += 0.0002   # survival tick (unchanged — intentionally tiny)
         elif prev_alive == 1 and next_alive == 0:
-            reward -= 4.0      # FIX: was -6.0; death still very bad but not 6× a kill
+            reward -= 3.0      # FIX: was -6.0; death still very bad but not 6× a kill
 
         bonus_gain = max(0, int(next_players[my_id][4]) - int(prev_players[my_id][4]))
         if bonus_gain > 0:
@@ -1522,7 +1522,7 @@ def compute_shaped_reward(
     if kills > 0:
         # FIX: raised from +0.9 to +2.0; last-enemy kill gets +3.5
         last_kill = (next_alive_e == 0)
-        bonus = 3.5 if last_kill else 2.0
+        bonus = 5.0 if last_kill else 4.0
         reward += bonus * kills
 
     boxes_destroyed = max(0, int(np.sum(prev_map == 2)) - int(np.sum(next_map == 2)))
@@ -1565,7 +1565,7 @@ def compute_shaped_reward(
 
     if terminated or truncated:
         if my_id < len(next_players) and int(next_players[my_id][2]) == 1:
-            reward += 10.0 if int(np.sum(next_players[:, 2])) == 1 else 0.05
+            reward += 15.0 if int(np.sum(next_players[:, 2])) == 1 else 0.05
         else:
             reward -= 1.5  # FIX: was -2.0
 
@@ -2310,7 +2310,7 @@ def main() -> None:
     
     model = BomberNet(INPUT_CHANNELS).to(DEVICE)
     current_dir     = os.path.dirname(os.path.abspath(__file__))
-    pretrained_path = os.path.join(current_dir, "model_bc_.pth")
+    pretrained_path = os.path.join(current_dir, "model_best_ppo.pth")
 
     # FIX v6: graceful weight loading — if checkpoint is missing or has wrong
     # shape (e.g. old 4×4-pool architecture), fall back to random init and
@@ -2345,10 +2345,10 @@ def main() -> None:
     best_wins = -1
     best_path = os.path.join(current_dir, "model_best_ppo.pth")  # FIX v6: track best
 
-    for round_idx in range(30, RL_ROUNDS):
+    for round_idx in range(RL_ROUNDS):
         # FIX v6: per-round LR decay — gentle cosine-like warmdown keeps
         # updates stable as the policy matures. 3e-4 → ~1.8e-4 at round 100.
-        round_lr = FINE_TUNE_LR * (0.995 ** round_idx)
+        round_lr = FINE_TUNE_LR
 
         print(
             f"--- PPO round {round_idx+1}/{RL_ROUNDS} | "
