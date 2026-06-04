@@ -573,7 +573,7 @@ class Agent:
         legal = _legal_action_mask(obs["map"], obs["bombs"], my_pos, bombs_left)
         # NO shield – the policy learned safety from rewards
         with torch.no_grad():
-            action = _sample_masked_action(self.model, state, legal, sample=True)
+            action = _sample_masked_action(self.model, state, legal, sample=False)
         return action
     
     def reset(self):
