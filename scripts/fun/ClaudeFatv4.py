@@ -1563,6 +1563,12 @@ def compute_shaped_reward(
 
     reward -= 0.001  # anti-stall
 
+    # NEW: penalty for dying while enemies still alive
+    if my_id < len(next_players) and int(next_players[my_id][2]) == 0:
+        remaining_enemies = int(np.sum(next_players[:, 2]))
+        if remaining_enemies > 0:
+            reward -= 1.0
+
     if terminated or truncated:
         if my_id < len(next_players) and int(next_players[my_id][2]) == 1:
             reward += 15.0 if int(np.sum(next_players[:, 2])) == 1 else 0.05
