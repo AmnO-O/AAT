@@ -1361,7 +1361,7 @@ def build_selfplay_opponents(
 
     # Curriculum schedule
     if round_idx < 15:
-        # Phase 1: Easy – 40% frozen, 30% league, 10% strong, 20% weak
+        # Phase 1: Easy – 40% frozen, 20% league, 10% strong, 30% weak
         frozen_p = 0.40
         league_p = 0.70   # cumulative: frozen + league
         strong_p = 0.80   # cumulative: frozen + league + strong
