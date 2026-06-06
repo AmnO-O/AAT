@@ -2079,7 +2079,7 @@ def _collect_single_process(
         cid  = gi % 4
         env  = BomberEnv(max_steps=MAX_STEPS, seed=seed)
         obs  = env.reset()
-        opps = build_selfplay_opponents(cid, seed, frozen_model, league_pool, round_idx)
+        opps = build_selfplay_opponents(cid, seed + gi, frozen_model, league_pool, round_idx)
 
         ep   = RolloutEpisode()
         done = False; step = 0
