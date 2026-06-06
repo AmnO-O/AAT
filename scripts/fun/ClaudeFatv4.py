@@ -1363,8 +1363,8 @@ def build_selfplay_opponents(
     if round_idx < 15:
         # Phase 1: Easy – 40% frozen, 20% league, 10% strong, 30% weak
         frozen_p = 0.40
-        league_p = 0.70   # cumulative: frozen + league
-        strong_p = 0.80   # cumulative: frozen + league + strong
+        league_p = 0.60   # cumulative: frozen + league
+        strong_p = 0.70   # cumulative: frozen + league + strong
         # rest is weak
     elif round_idx < 30:
         # Phase 2: Medium – 30% frozen, 20% league, 30% strong, 20% weak
