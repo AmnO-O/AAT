@@ -189,7 +189,7 @@ AUGMENT_FLIP_PROB = 0.5
 
 # --- PPO / self-play
 RL_ROUNDS               = 100   # FIX v6: was 20 — not enough to converge
-ROLLOUT_GAMES_PER_ROUND = 400   # FIX v6: was 300 — more diverse states per round
+ROLLOUT_GAMES_PER_ROUND = 600   # FIX v6: was 300 — more diverse states per round
 PPO_EPOCHS              = 4     # FIX v6: was 6 — clip was firing hard by epoch 3-4
 PPO_BATCH_SIZE          = 256
 PPO_CLIP_EPS            = 0.20  # FIX v6: restored from 0.15 — 3 epochs no longer oscillate
