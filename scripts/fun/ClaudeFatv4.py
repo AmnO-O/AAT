@@ -189,8 +189,8 @@ AUGMENT_FLIP_PROB = 0.5
 
 # --- PPO / self-play
 RL_ROUNDS               = 100   # FIX v6: was 20 — not enough to converge
-ROLLOUT_GAMES_PER_ROUND = 650   # FIX v6: was 300 — more diverse states per round
-PPO_EPOCHS              = 3     # FIX v6: was 6 — clip was firing hard by epoch 3-4
+ROLLOUT_GAMES_PER_ROUND = 400   # FIX v6: was 300 — more diverse states per round
+PPO_EPOCHS              = 4     # FIX v6: was 6 — clip was firing hard by epoch 3-4
 PPO_BATCH_SIZE          = 256
 PPO_CLIP_EPS            = 0.20  # FIX v6: restored from 0.15 — 3 epochs no longer oscillate
 PPO_GAMMA               = 0.98
@@ -1550,7 +1550,7 @@ def compute_shaped_reward(
     if kills > 0:
         # FIX: raised from +0.9 to +2.0; last-enemy kill gets +3.5
         last_kill = (next_alive_e == 0)
-        bonus = 3.5 if last_kill else 2.0
+        bonus = 4.5 if last_kill else 2.0
         reward += bonus * kills
 
     boxes_destroyed = max(0, int(np.sum(prev_map == 2)) - int(np.sum(next_map == 2)))
@@ -1593,7 +1593,7 @@ def compute_shaped_reward(
 
     if terminated or truncated:
         if my_id < len(next_players) and int(next_players[my_id][2]) == 1:
-            reward += 10.0 if int(np.sum(next_players[:, 2])) == 1 else 0.05
+            reward += 11.0 if int(np.sum(next_players[:, 2])) == 1 else 0.05
         else:
             reward -= 1.5  # FIX: was -2.0
 
@@ -2070,7 +2070,12 @@ def _collect_single_process(
     episodes: List[RolloutEpisode] = []
 
     for gi in range(num_games):
-        seed = 300000 + SEED + round_idx * 10000 + gi
+        FIXED_MAP_ROUNDS = 12
+        if round_idx < FIXED_MAP_ROUNDS:
+            seed = 300000 + SEED + gi          
+        else:
+            seed = 300000 + SEED + round_idx * 10000 + gi
+
         cid  = gi % 4
         env  = BomberEnv(max_steps=MAX_STEPS, seed=seed)
         obs  = env.reset()
