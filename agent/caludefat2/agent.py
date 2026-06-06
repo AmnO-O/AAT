@@ -550,7 +550,7 @@ class Agent:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = BomberNet().to(self.device)
         # Đường dẫn checkpoint - bạn có thể đổi tên file nếu cần
-        model_path = "model_bc.pth"   # hoặc "model_bc_.pth"
+        model_path = "model_best_ppo.pth"   # hoặc "model_bc_.pth"
         model_path = os.path.join(os.path.dirname(__file__), model_path)
         try:
             self.model.load_state_dict(torch.load(model_path, map_location=self.device))
