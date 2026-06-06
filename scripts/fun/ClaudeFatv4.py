@@ -182,23 +182,23 @@ GRAD_CLIP_NORM      = 1.0
 TRAIN_DIR       = "bc_train_chunks"
 VAL_DIR         = "bc_val_chunks"
 MODEL_PATH      = "model_bc_.pth"
-BEST_MODEL_PATH = "model_bc_best_.pth"
+BEST_MODEL_PATH = "model_bc_best.pth"
 MANIFEST_NAME   = "manifest.json"
 
 AUGMENT_FLIP_PROB = 0.5
 
 # --- PPO / self-play
 RL_ROUNDS               = 100   # FIX v6: was 20 — not enough to converge
-ROLLOUT_GAMES_PER_ROUND = 500   # FIX v6: was 300 — more diverse states per round
+ROLLOUT_GAMES_PER_ROUND = 650   # FIX v6: was 300 — more diverse states per round
 PPO_EPOCHS              = 3     # FIX v6: was 6 — clip was firing hard by epoch 3-4
 PPO_BATCH_SIZE          = 256
 PPO_CLIP_EPS            = 0.20  # FIX v6: restored from 0.15 — 3 epochs no longer oscillate
 PPO_GAMMA               = 0.98
 PPO_LAMBDA              = 0.95
 PPO_VALUE_COEF          = 0.5
-PPO_ENTROPY_COEF        = 0.03  # annealed per round below
-PPO_ENTROPY_DECAY       = 0.80  # multiply per round; floor at PPO_ENTROPY_MIN
-PPO_ENTROPY_MIN         = 0.005
+PPO_ENTROPY_COEF        = 0.05  # annealed per round below
+PPO_ENTROPY_DECAY       = 0.95  # multiply per round; floor at PPO_ENTROPY_MIN
+PPO_ENTROPY_MIN         = 0.01
 PPO_MAX_GRAD_NORM       = 1.0
 BC_MIX_COEF             = 0.00  # FIX v6: was 0.05 — BC anchor was preventing PPO improvement
 LEAGUE_POOL_SIZE        = 8
@@ -1119,7 +1119,7 @@ class BomberNet(nn.Module):
 
         # Separate 1×1 projections for policy vs value
         p = torch.relu(self.policy_conv(feat))   # batch × 8 × 7 × 7
-        v = torch.relu(self.value_conv(feat))    # batch × 8 × 7 × 7
+        v = torch.relu(self.value_conv(feat.detach())) # batch × 8 × 7 × 7
 
         p_in = torch.cat([p.flatten(1), sc], dim=1)  # batch × 399
         v_in = torch.cat([v.flatten(1), sc], dim=1)  # batch × 399
@@ -1332,40 +1332,68 @@ def build_selfplay_opponents(
     controlled_id: int, game_seed: int,
     frozen_model: Optional[nn.Module] = None,
     league_pool: Optional[LeaguePool] = None,
+    round_idx: int = 0,          # ← added for curriculum
 ) -> Dict[int, object]:
     """
-    Assign opponents for PPO rollout.
-    FIX v6: 40% frozen-current / 20% league / 40% strong baselines.
-    Previous 80% self-play meant training against a near-baseline policy;
-    raising baselines to 40% forces learning to beat tactical opponents.
-    Baseline pool: tactical (4×) / genius (3×) / smarter (2×) only — no random/simple.
-    FIX v6: removed .to(DEVICE) on league snapshots — in worker processes the
-    models live on CPU; coercing to DEVICE caused CUDA/CPU device mismatches.
+    Assign opponents for PPO rollout with a curriculum:
+    - Early rounds (0-14): mostly frozen/league/weak → easy wins
+    - Middle rounds (15-29): mix in strong baselines
+    - Late rounds (30+): tough mix for final training
     """
     rng = random.Random(game_seed)
-    # Strong baselines only: weighted toward top performers
-    base_pool = []
-    for cls, weight in [(TacticalRuleAgent, 4), (GeniusRuleAgent, 3), (SmarterRuleAgent, 2)]:
+
+    # Strong baselines
+    base_strong = []
+    for cls, w in [(TacticalRuleAgent,4),(GeniusRuleAgent,3),(SmarterRuleAgent,2)]:
         if cls is not None:
-            base_pool.extend([cls] * weight)
-    if not base_pool:
-        base_pool = [_FallbackRuleAgent]
+            base_strong.extend([cls] * w)
+
+    # Weak baselines
+    base_weak = []
+    for cls, w in [(SimpleRuleAgent,3),(BoxFarmerAgent,2)]:
+        if cls is not None:
+            base_weak.extend([cls] * w)
+
+    if not base_strong:
+        base_strong = [_FallbackRuleAgent]
+    if not base_weak:
+        base_weak = base_strong
+
+    # Curriculum schedule
+    if round_idx < 15:
+        # Phase 1: Easy – 40% frozen, 30% league, 10% strong, 20% weak
+        frozen_p = 0.40
+        league_p = 0.70   # cumulative: frozen + league
+        strong_p = 0.80   # cumulative: frozen + league + strong
+        # rest is weak
+    elif round_idx < 30:
+        # Phase 2: Medium – 30% frozen, 20% league, 30% strong, 20% weak
+        frozen_p = 0.30
+        league_p = 0.50
+        strong_p = 0.80
+    else:
+        # Phase 3: Hard – 20% frozen, 15% league, 50% strong, 15% weak
+        frozen_p = 0.20
+        league_p = 0.35
+        strong_p = 0.85
 
     opponents: Dict[int, object] = {}
     for pid in [p for p in range(4) if p != controlled_id]:
         r = rng.random()
-        if r < 0.05 and frozen_model is not None:           # 5% frozen current
+        if r < frozen_p and frozen_model is not None:
             fp = FrozenPolicyAgent(pid, frozen_model, deterministic=rng.random() < 0.7)
             fp.reset()
             opponents[pid] = fp
-        elif r < 0.10 and league_pool is not None and league_pool.snapshots:  # 5% league
-            # FIX v6: do NOT call .to(DEVICE) — keep model on its own device
+        elif r < league_p and league_pool is not None and league_pool.snapshots:
             lm = league_pool.sample()
             fp = FrozenPolicyAgent(pid, lm, deterministic=rng.random() < 0.5)
             fp.reset()
             opponents[pid] = fp
-        else:                                                # 90% strong baselines
-            opponents[pid] = rng.choice(base_pool)(pid)
+        elif r < strong_p:
+            opponents[pid] = rng.choice(base_strong)(pid)
+        else:
+            opponents[pid] = rng.choice(base_weak)(pid)
+
     return opponents
 
 
@@ -1501,7 +1529,7 @@ def compute_shaped_reward(
         if prev_alive == 1 and next_alive == 1:
             reward += 0.0002   # survival tick (unchanged — intentionally tiny)
         elif prev_alive == 1 and next_alive == 0:
-            reward -= 3.0      # FIX: was -6.0; death still very bad but not 6× a kill
+            reward -= 4.0      # FIX: was -6.0; death still very bad but not 6× a kill
 
         bonus_gain = max(0, int(next_players[my_id][4]) - int(prev_players[my_id][4]))
         if bonus_gain > 0:
@@ -1522,7 +1550,7 @@ def compute_shaped_reward(
     if kills > 0:
         # FIX: raised from +0.9 to +2.0; last-enemy kill gets +3.5
         last_kill = (next_alive_e == 0)
-        bonus = 5.0 if last_kill else 4.0
+        bonus = 3.5 if last_kill else 2.0
         reward += bonus * kills
 
     boxes_destroyed = max(0, int(np.sum(prev_map == 2)) - int(np.sum(next_map == 2)))
@@ -1563,15 +1591,9 @@ def compute_shaped_reward(
 
     reward -= 0.001  # anti-stall
 
-    # NEW: penalty for dying while enemies still alive
-    if my_id < len(next_players) and int(next_players[my_id][2]) == 0:
-        remaining_enemies = int(np.sum(next_players[:, 2]))
-        if remaining_enemies > 0:
-            reward -= 1.0
-
     if terminated or truncated:
         if my_id < len(next_players) and int(next_players[my_id][2]) == 1:
-            reward += 15.0 if int(np.sum(next_players[:, 2])) == 1 else 0.05
+            reward += 10.0 if int(np.sum(next_players[:, 2])) == 1 else 0.05
         else:
             reward -= 1.5  # FIX: was -2.0
 
@@ -1868,7 +1890,7 @@ def _worker_collect(
         for gi, (seed, cid) in enumerate(zip(game_seeds, cids)):
             env  = BomberEnv(max_steps=MAX_STEPS, seed=seed)
             obs  = env.reset()
-            opps = build_selfplay_opponents(cid, seed, frozen_model, league_pool)
+            opps = build_selfplay_opponents(cid, seed, frozen_model, league_pool, round_idx)
 
             ep   = RolloutEpisode()
             done = False; step = 0
@@ -2133,6 +2155,7 @@ def ppo_finetune(
     model: nn.Module,
     episodes: List[RolloutEpisode],
     bc_mix_dir: Optional[str] = None,
+    optimizer: optim.AdamW = None,             
     entropy_coef: float = PPO_ENTROPY_COEF,
     lr: float = FINE_TUNE_LR,   # FIX v6: per-round LR decay passed from main()
 ) -> nn.Module:
@@ -2140,7 +2163,9 @@ def ppo_finetune(
         return model
     states, actions, old_lps, old_vals, returns, advantages, masks = _flatten_episodes(episodes)
     N         = states.shape[0]
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
+    
+    for pg in optimizer.param_groups:
+        pg['lr'] = lr
 
     # FIX v6: only load BC data when BC_MIX_COEF > 0. Previously the loader
     # was always constructed (and bc_iter always non-None), adding pointless
@@ -2349,7 +2374,9 @@ def main() -> None:
 
     ent_coef  = float(PPO_ENTROPY_COEF)
     best_wins = -1
-    best_path = os.path.join(current_dir, "model_best_ppo.pth")  # FIX v6: track best
+    best_path = os.path.join(current_dir, "model_best_ppo_.pth")  # FIX v6: track best
+
+    optimizer = optim.AdamW(model.parameters(), lr=FINE_TUNE_LR, weight_decay=WEIGHT_DECAY)
 
     for round_idx in range(RL_ROUNDS):
         # FIX v6: per-round LR decay — gentle cosine-like warmdown keeps
@@ -2379,6 +2406,7 @@ def main() -> None:
         model = ppo_finetune(
             model, rollouts,
             bc_mix_dir=TRAIN_DIR,
+            optimizer = optimizer,
             entropy_coef=ent_coef,
             lr=round_lr,         # FIX v6: pass decayed LR
         )
