@@ -629,9 +629,9 @@ def _build_pool(clss_weights):
         if cls is not None: pool.extend([cls]*w)
     return pool or [_FallbackRuleAgent]
 
-_POOL_STRONG = _build_pool([(TacticalRuleAgent,4),(GeniusRuleAgent,3)])
-_POOL_MEDIUM = _build_pool([(SmarterRuleAgent,3),(BoxFarmerAgent,2)])
-_POOL_WEAK   = _build_pool([(SimpleRuleAgent,3),(RandomAgent,2),(_FallbackRuleAgent,1)])
+_POOL_STRONG = _build_pool([(TacticalRuleAgent,4),(GeniusRuleAgent,3), (SmarterRuleAgent,1)])
+_POOL_MEDIUM = _build_pool([(SmarterRuleAgent,3), (SimpleRuleAgent,4), (BoxFarmerAgent,1)])
+_POOL_WEAK   = _build_pool([(SimpleRuleAgent,3),(BoxFarmerAgent,2),(_FallbackRuleAgent,1)])
 
 def build_eval_opponents(controlled_id, seed):
     """Mixed pool for eval — all baselines equally represented."""
