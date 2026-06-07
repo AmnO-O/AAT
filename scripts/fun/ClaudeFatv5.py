@@ -93,7 +93,7 @@ SCALAR_CHANNELS:  List[int] = [14,17,18,19,20,22,23]                            
 # Training maps: 100 distinct seeds, reused every round.
 # Eval maps:     50 distinct seeds, NEVER used during training.
 # ---------------------------------------------------------------------------
-N_TRAIN_MAPS     = 5
+N_TRAIN_MAPS     = 100
 N_EVAL_MAPS      = 50
 _TRAIN_MAP_SEEDS = [300_000 + SEED + i * 137 for i in range(N_TRAIN_MAPS)]
 _EVAL_MAP_SEEDS  = [900_000 + SEED + i * 137 for i in range(N_EVAL_MAPS)]
@@ -679,7 +679,7 @@ def build_train_opponents(controlled_id, opp_seed, frozen_model, league_pool, ro
     rng = random.Random(opp_seed)
 
     if round_idx < 10:
-        p_frozen=0.55; p_league=0.25; p_weak=0.20; p_medium=0.00; p_strong=0.00
+        p_frozen=0.05; p_league=0.05; p_weak=0.05; p_medium=0.85; p_strong=0.00
     elif round_idx < 30:
         p_frozen=0.40; p_league=0.25; p_weak=0.15; p_medium=0.15; p_strong=0.05
     elif round_idx < 60:
@@ -973,7 +973,7 @@ def main():
     print(f"BomberNet: {n_params:,} parameters", flush=True)
     
     current_dir     = os.path.dirname(os.path.abspath(__file__))
-    pretrained_path = os.path.join(current_dir, "model_v7_best.pth")
+    pretrained_path = os.path.join(current_dir, "model_best_ppo.pth")
 
     # Resume if checkpoint exists
     start_round = 0
