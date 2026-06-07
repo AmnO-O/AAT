@@ -93,7 +93,7 @@ SCALAR_CHANNELS:  List[int] = [14,17,18,19,20,22,23]                            
 # Training maps: 100 distinct seeds, reused every round.
 # Eval maps:     50 distinct seeds, NEVER used during training.
 # ---------------------------------------------------------------------------
-N_TRAIN_MAPS     = 100
+N_TRAIN_MAPS     = 30
 N_EVAL_MAPS      = 50
 _TRAIN_MAP_SEEDS = [300_000 + SEED + i * 137 for i in range(N_TRAIN_MAPS)]
 _EVAL_MAP_SEEDS  = [900_000 + SEED + i * 137 for i in range(N_EVAL_MAPS)]
@@ -973,7 +973,7 @@ def main():
     print(f"BomberNet: {n_params:,} parameters", flush=True)
     
     current_dir     = os.path.dirname(os.path.abspath(__file__))
-    pretrained_path = os.path.join(current_dir, "model_best_ppo.pth")
+    pretrained_path = os.path.join(current_dir, "model_v7_best.pth")
 
     # Resume if checkpoint exists
     start_round = 0
