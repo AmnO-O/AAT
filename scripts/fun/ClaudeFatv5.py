@@ -971,15 +971,25 @@ def main():
     model = BomberNet(INPUT_CHANNELS).to(DEVICE)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"BomberNet: {n_params:,} parameters", flush=True)
+    
+    current_dir     = os.path.dirname(os.path.abspath(__file__))
+    pretrained_path = os.path.join(current_dir, "model_best_ppo.pth")
 
     # Resume if checkpoint exists
     start_round = 0
-    if os.path.exists(MODEL_PATH):
+    if os.path.exists(pretrained_path):
         try:
-            model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-            print(f"Resumed from {MODEL_PATH}", flush=True)
+            state = torch.load(pretrained_path, map_location=DEVICE)
+            model.load_state_dict(state, strict=True)
+            print(f"Loaded pretrained weights from {pretrained_path}", flush=True)
         except Exception as e:
-            print(f"Could not resume ({e}). Starting fresh.", flush=True)
+            print(
+                f"WARNING: Could not load {pretrained_path} ({e}).\n"
+                f"         The checkpoint is likely from the old 4×4-pool architecture.\n"
+                f"         Uncomment phases 1-4 in main() and re-run BC before PPO.\n"
+                f"         Continuing with random init — PPO will be slow to warm up.",
+                flush=True,
+            )
     else:
         print("Starting from random initialization.", flush=True)
 
