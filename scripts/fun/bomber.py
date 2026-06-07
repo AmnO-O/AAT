@@ -874,7 +874,7 @@ def collect_rollouts(model, frozen_model, num_games, round_idx, league_pool):
 
     for gi in range(num_games):
         map_seed = _TRAIN_MAP_SEEDS[gi % N_TRAIN_MAPS]
-        opp_seed = (map_seed + round_idx * 999_983 + gi * 1_000_003) & 0x7FFFFFFF
+        opp_seed = (map_seed + gi * 1_000_003) & 0x7FFFFFFF
 
         cid  = gi % 4
         env  = BomberEnv(max_steps=MAX_STEPS, seed=map_seed)
