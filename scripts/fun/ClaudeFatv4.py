@@ -1890,7 +1890,7 @@ def _worker_collect(
         for gi, (seed, cid) in enumerate(zip(game_seeds, cids)):
             env  = BomberEnv(max_steps=MAX_STEPS, seed=seed)
             obs  = env.reset()
-            opps = build_selfplay_opponents(cid, seed, frozen_model, league_pool, round_idx)
+            opps = build_selfplay_opponents(cid, seed + gi, frozen_model, league_pool, round_idx)
 
             ep   = RolloutEpisode()
             done = False; step = 0
@@ -2379,7 +2379,7 @@ def main() -> None:
 
     ent_coef  = float(PPO_ENTROPY_COEF)
     best_wins = -1
-    best_path = os.path.join(current_dir, "model_best_ppo_.pth")  # FIX v6: track best
+    best_path = os.path.join(current_dir, "model_best_ppo__.pth")  # FIX v6: track best
 
     optimizer = optim.AdamW(model.parameters(), lr=FINE_TUNE_LR, weight_decay=WEIGHT_DECAY)
 
