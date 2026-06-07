@@ -93,7 +93,7 @@ SCALAR_CHANNELS:  List[int] = [14,17,18,19,20,22,23]                            
 # Training maps: 100 distinct seeds, reused every round.
 # Eval maps:     50 distinct seeds, NEVER used during training.
 # ---------------------------------------------------------------------------
-N_TRAIN_MAPS     = 100
+N_TRAIN_MAPS     = 20
 N_EVAL_MAPS      = 50
 _TRAIN_MAP_SEEDS = [300_000 + SEED + i * 137 for i in range(N_TRAIN_MAPS)]
 _EVAL_MAP_SEEDS  = [900_000 + SEED + i * 137 for i in range(N_EVAL_MAPS)]
@@ -102,8 +102,8 @@ _EVAL_MAP_SEEDS  = [900_000 + SEED + i * 137 for i in range(N_EVAL_MAPS)]
 # PPO hyperparameters
 # ---------------------------------------------------------------------------
 RL_ROUNDS               = 150
-ROLLOUT_GAMES_PER_ROUND = 650
-PPO_EPOCHS              = 4
+ROLLOUT_GAMES_PER_ROUND = 300
+PPO_EPOCHS              = 3
 PPO_BATCH_SIZE          = 256
 PPO_CLIP_EPS            = 0.20
 PPO_GAMMA               = 0.98
@@ -630,7 +630,7 @@ def _build_pool(clss_weights):
     return pool or [_FallbackRuleAgent]
 
 _POOL_STRONG = _build_pool([(TacticalRuleAgent,4),(GeniusRuleAgent,3), (SmarterRuleAgent,1)])
-_POOL_MEDIUM = _build_pool([(SmarterRuleAgent,3), (SimpleRuleAgent,4), (BoxFarmerAgent,1)])
+_POOL_MEDIUM = _build_pool([(SmarterRuleAgent,3), (SimpleRuleAgent,4)])
 _POOL_WEAK   = _build_pool([(SimpleRuleAgent,3),(BoxFarmerAgent,2),(_FallbackRuleAgent,1)])
 
 def build_eval_opponents(controlled_id, seed):
@@ -681,7 +681,9 @@ def build_train_opponents(controlled_id, opp_seed, frozen_model, league_pool, ro
     if round_idx < 10:
         p_frozen=0.05; p_league=0.05; p_weak=0.05; p_medium=0.85; p_strong=0.00
     elif round_idx < 30:
-        p_frozen=0.40; p_league=0.25; p_weak=0.15; p_medium=0.15; p_strong=0.05
+        p_frozen=0.05; p_league=0.05; p_weak=0.05; p_medium=0.85; p_strong=0.00
+
+       # p_frozen=0.40; p_league=0.25; p_weak=0.15; p_medium=0.15; p_strong=0.05
     elif round_idx < 60:
         p_frozen=0.30; p_league=0.20; p_weak=0.05; p_medium=0.20; p_strong=0.25
     else:
@@ -973,7 +975,7 @@ def main():
     print(f"BomberNet: {n_params:,} parameters", flush=True)
     
     current_dir     = os.path.dirname(os.path.abspath(__file__))
-    pretrained_path = os.path.join(current_dir, "model_best_ppo.pth")
+    pretrained_path = os.path.join(current_dir, "model_v7.pth")
 
     # Resume if checkpoint exists
     start_round = 0
