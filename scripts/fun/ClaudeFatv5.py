@@ -54,6 +54,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Categorical
 
+from scripts.fun.bomber import evaluate_on_train
+
 sys.path.append(os.getcwd())
 from engine.game import BomberEnv
 
@@ -93,7 +95,7 @@ SCALAR_CHANNELS:  List[int] = [14,17,18,19,20,22,23]                            
 # Training maps: 100 distinct seeds, reused every round.
 # Eval maps:     50 distinct seeds, NEVER used during training.
 # ---------------------------------------------------------------------------
-N_TRAIN_MAPS     = 20
+N_TRAIN_MAPS     = 30
 N_EVAL_MAPS      = 50
 _TRAIN_MAP_SEEDS = [300_000 + SEED + i * 137 for i in range(N_TRAIN_MAPS)]
 _EVAL_MAP_SEEDS  = [900_000 + SEED + i * 137 for i in range(N_EVAL_MAPS)]
@@ -102,7 +104,7 @@ _EVAL_MAP_SEEDS  = [900_000 + SEED + i * 137 for i in range(N_EVAL_MAPS)]
 # PPO hyperparameters
 # ---------------------------------------------------------------------------
 RL_ROUNDS               = 150
-ROLLOUT_GAMES_PER_ROUND = 300
+ROLLOUT_GAMES_PER_ROUND = 400
 PPO_EPOCHS              = 3
 PPO_BATCH_SIZE          = 256
 PPO_CLIP_EPS            = 0.20
@@ -630,7 +632,7 @@ def _build_pool(clss_weights):
     return pool or [_FallbackRuleAgent]
 
 _POOL_STRONG = _build_pool([(TacticalRuleAgent,4),(GeniusRuleAgent,3), (SmarterRuleAgent,1)])
-_POOL_MEDIUM = _build_pool([(SmarterRuleAgent,3), (SimpleRuleAgent,4)])
+_POOL_MEDIUM = _build_pool([(SmarterRuleAgent,1), (SimpleRuleAgent,4)])
 _POOL_WEAK   = _build_pool([(SimpleRuleAgent,3),(BoxFarmerAgent,2),(_FallbackRuleAgent,1)])
 
 def build_eval_opponents(controlled_id, seed):
@@ -679,9 +681,9 @@ def build_train_opponents(controlled_id, opp_seed, frozen_model, league_pool, ro
     rng = random.Random(opp_seed)
 
     if round_idx < 10:
-        p_frozen=0.05; p_league=0.05; p_weak=0.05; p_medium=0.85; p_strong=0.00
+        p_frozen=0.15; p_league=0.05; p_weak=0.05; p_medium=0.55; p_strong=0.20
     elif round_idx < 30:
-        p_frozen=0.05; p_league=0.05; p_weak=0.05; p_medium=0.85; p_strong=0.00
+        p_frozen=0.15; p_league=0.05; p_weak=0.05; p_medium=0.55; p_strong=0.20
 
        # p_frozen=0.40; p_league=0.25; p_weak=0.15; p_medium=0.15; p_strong=0.05
     elif round_idx < 60:
@@ -829,7 +831,7 @@ def collect_rollouts(model, frozen_model, num_games, round_idx, league_pool):
 
     for gi in range(num_games):
         map_seed = _TRAIN_MAP_SEEDS[gi % N_TRAIN_MAPS]
-        opp_seed = (map_seed + round_idx * 999_983 + gi * 1_000_003) & 0x7FFFFFFF
+        opp_seed = (map_seed + gi * 1_000_003) & 0x7FFFFFFF
 
         cid  = gi % 4
         env  = BomberEnv(max_steps=MAX_STEPS, seed=map_seed)
@@ -963,6 +965,7 @@ def evaluate(model, num_games=20, return_wins=False):
           f"kills={total_kills/ng:.2f} steps={total_steps/ng:.0f}", flush=True)
     return wins if return_wins else None
 
+
 # ===========================================================================
 # Main — pure self-play from scratch
 # ===========================================================================
@@ -995,6 +998,8 @@ def main():
     else:
         print("Starting from random initialization.", flush=True)
 
+    evaluate_on_train(model, num_games=20)
+
     # Persistent optimizer — momentum carries across rounds
     optimizer = optim.AdamW(model.parameters(), lr=FINE_TUNE_LR, weight_decay=WEIGHT_DECAY)
 
@@ -1026,6 +1031,8 @@ def main():
 
         # Evaluate on held-out maps
         wins = evaluate(model, num_games=20, return_wins=True)
+        evaluate_on_train(model, num_games=20)
+        
         if wins > best_wins:
             best_wins = wins
             torch.save(model.state_dict(), BEST_PPO_PATH)

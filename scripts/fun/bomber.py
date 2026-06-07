@@ -93,7 +93,7 @@ SCALAR_CHANNELS:  List[int] = [14,17,18,19,20,22,23]                            
 # Training maps: 100 distinct seeds, reused every round.
 # Eval maps:     50 distinct seeds, NEVER used during training.
 # ---------------------------------------------------------------------------
-N_TRAIN_MAPS     = 20
+N_TRAIN_MAPS     = 30
 N_EVAL_MAPS      = 50
 _TRAIN_MAP_SEEDS = [300_000 + SEED + i * 137 for i in range(N_TRAIN_MAPS)]
 _EVAL_MAP_SEEDS  = [900_000 + SEED + i * 137 for i in range(N_EVAL_MAPS)]
@@ -102,7 +102,7 @@ _EVAL_MAP_SEEDS  = [900_000 + SEED + i * 137 for i in range(N_EVAL_MAPS)]
 # PPO hyperparameters
 # ---------------------------------------------------------------------------
 RL_ROUNDS               = 150
-ROLLOUT_GAMES_PER_ROUND = 300
+ROLLOUT_GAMES_PER_ROUND = 400
 PPO_EPOCHS              = 3
 PPO_BATCH_SIZE          = 256
 PPO_CLIP_EPS            = 0.20
@@ -675,7 +675,7 @@ def _build_pool(clss_weights):
     return pool or [_FallbackRuleAgent]
 
 _POOL_STRONG = _build_pool([(TacticalRuleAgent,4),(GeniusRuleAgent,3), (SmarterRuleAgent,1)])
-_POOL_MEDIUM = _build_pool([(SmarterRuleAgent,3), (SimpleRuleAgent,4)])
+_POOL_MEDIUM = _build_pool([(SmarterRuleAgent,1), (SimpleRuleAgent,6)])
 _POOL_WEAK   = _build_pool([(SimpleRuleAgent,3),(BoxFarmerAgent,2),(_FallbackRuleAgent,1)])
 
 def build_eval_opponents(controlled_id, seed):
@@ -724,9 +724,9 @@ def build_train_opponents(controlled_id, opp_seed, frozen_model, league_pool, ro
     rng = random.Random(opp_seed)
 
     if round_idx < 10:
-        p_frozen=0.05; p_league=0.05; p_weak=0.05; p_medium=0.85; p_strong=0.00
+        p_frozen=0.15; p_league=0.05; p_weak=0.05; p_medium=0.45; p_strong=0.30
     elif round_idx < 30:
-        p_frozen=0.05; p_league=0.05; p_weak=0.15; p_medium=0.70; p_strong=0.05
+        p_frozen=0.15; p_league=0.05; p_weak=0.05; p_medium=0.45; p_strong=0.30
 
        # p_frozen=0.40; p_league=0.25; p_weak=0.15; p_medium=0.15; p_strong=0.05
     elif round_idx < 60:
@@ -1008,6 +1008,50 @@ def evaluate(model, num_games=20, return_wins=False):
           f"kills={total_kills/ng:.2f} steps={total_steps/ng:.0f}", flush=True)
     return wins if return_wins else None
 
+def evaluate_on_train(model, num_games=20, return_wins=False):
+    """
+    Eval on training maps — not a true measure of generalisation, but useful for fast feedback during development.
+    Uses deterministic argmax + legal mask (same conditions as training).
+    """
+    model.eval()
+    wins = draws = losses = total_kills = total_steps = 0
+
+    for gi in range(num_games):
+        map_seed = _TRAIN_MAP_SEEDS[gi % N_TRAIN_MAPS]
+        opp_seed = map_seed + gi * 9_999_991
+        cid  = gi % 4
+        env  = BomberEnv(max_steps=MAX_STEPS, seed=map_seed)
+        obs  = env.reset()
+        opps = build_train_opponents(cid, opp_seed, None, None, 1)  # all strong for max challenge
+        kills = 0; done = False; step = 0
+
+        while not done:
+            if int(obs["players"][cid][2]) != 1: break
+            state = encode_obs(obs["map"],obs["players"],obs["bombs"],cid,step).unsqueeze(0).to(DEVICE)
+            pos   = (int(obs["players"][cid][0]), int(obs["players"][cid][1]))
+            bl    = int(obs["players"][cid][3])
+            lm    = _legal_mask(obs["map"], obs["bombs"], pos, bl)
+            with torch.no_grad():
+                action, _, _, _ = _sample_action(model, state, lm, sample=False)
+            prev_e = sum(int(obs["players"][i][2]) for i in range(4) if i!=cid)
+            acts = [0,0,0,0]; acts[cid] = action
+            for pid, ag in opps.items(): acts[pid] = int(ag.act(obs))
+            obs, terminated, truncated = env.step(acts)
+            kills += max(0, prev_e - sum(int(obs["players"][i][2]) for i in range(4) if i!=cid))
+            done = bool(terminated or truncated); step += 1
+
+        alive = [int(p[2]) for p in obs["players"]]
+        if alive[cid]==1 and sum(alive)==1: wins+=1
+        elif alive[cid]==1: draws+=1
+        else: losses+=1
+        total_kills+=kills; total_steps+=step
+
+    ng = max(1, num_games)
+    print(f"Train Eval ({num_games}g) | W={wins} D={draws} L={losses} | "
+          f"kills={total_kills/ng:.2f} steps={total_steps/ng:.0f}", flush=True)
+    return wins if return_wins else None
+
+
 # ===========================================================================
 # Main — pure self-play from scratch
 # ===========================================================================
@@ -1039,6 +1083,7 @@ def main():
             )
     else:
         print("Starting from random initialization.", flush=True)
+    evaluate_on_train(model, num_games=20)
 
     # Persistent optimizer — momentum carries across rounds
     optimizer = optim.AdamW(model.parameters(), lr=FINE_TUNE_LR, weight_decay=WEIGHT_DECAY)
@@ -1071,6 +1116,8 @@ def main():
 
         # Evaluate on held-out maps
         wins = evaluate(model, num_games=20, return_wins=True)
+        evaluate_on_train(model, num_games=20)
+
         if wins > best_wins:
             best_wins = wins
             torch.save(model.state_dict(), BEST_PPO_PATH)
