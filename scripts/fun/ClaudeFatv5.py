@@ -95,7 +95,7 @@ SCALAR_CHANNELS:  List[int] = [14,17,18,19,20,22,23]                            
 # Training maps: 100 distinct seeds, reused every round.
 # Eval maps:     50 distinct seeds, NEVER used during training.
 # ---------------------------------------------------------------------------
-N_TRAIN_MAPS     = 30
+N_TRAIN_MAPS     = 25
 N_EVAL_MAPS      = 50
 _TRAIN_MAP_SEEDS = [300_000 + SEED + i * 137 for i in range(N_TRAIN_MAPS)]
 _EVAL_MAP_SEEDS  = [900_000 + SEED + i * 137 for i in range(N_EVAL_MAPS)]
@@ -681,10 +681,9 @@ def build_train_opponents(controlled_id, opp_seed, frozen_model, league_pool, ro
     rng = random.Random(opp_seed)
 
     if round_idx < 10:
-        p_frozen=0.15; p_league=0.05; p_weak=0.05; p_medium=0.55; p_strong=0.20
+        p_frozen=0.30; p_league=0.10; p_weak=0.05; p_medium=0.25; p_strong=0.30
     elif round_idx < 30:
-        p_frozen=0.15; p_league=0.05; p_weak=0.05; p_medium=0.55; p_strong=0.20
-
+        p_frozen=0.30; p_league=0.10; p_weak=0.05; p_medium=0.25; p_strong=0.30
        # p_frozen=0.40; p_league=0.25; p_weak=0.15; p_medium=0.15; p_strong=0.05
     elif round_idx < 60:
         p_frozen=0.30; p_league=0.20; p_weak=0.05; p_medium=0.20; p_strong=0.25
@@ -831,7 +830,7 @@ def collect_rollouts(model, frozen_model, num_games, round_idx, league_pool):
 
     for gi in range(num_games):
         map_seed = _TRAIN_MAP_SEEDS[gi % N_TRAIN_MAPS]
-        opp_seed = (map_seed + gi * 1_000_003) & 0x7FFFFFFF
+        opp_seed = (map_seed + round_idx * 999_983 + gi * 1_000_003) & 0x7FFFFFFF
 
         cid  = gi % 4
         env  = BomberEnv(max_steps=MAX_STEPS, seed=map_seed)
