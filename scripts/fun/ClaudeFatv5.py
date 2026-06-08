@@ -95,7 +95,7 @@ SCALAR_CHANNELS:  List[int] = [14,17,18,19,20,22,23]                            
 # Training maps: 100 distinct seeds, reused every round.
 # Eval maps:     50 distinct seeds, NEVER used during training.
 # ---------------------------------------------------------------------------
-N_TRAIN_MAPS     = 25
+N_TRAIN_MAPS     = 35
 N_EVAL_MAPS      = 50
 _TRAIN_MAP_SEEDS = [300_000 + SEED + i * 137 for i in range(N_TRAIN_MAPS)]
 _EVAL_MAP_SEEDS  = [900_000 + SEED + i * 137 for i in range(N_EVAL_MAPS)]
