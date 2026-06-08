@@ -673,39 +673,40 @@ class LeaguePool:
 def build_train_opponents(controlled_id, opp_seed, frozen_model, league_pool, round_idx):
     """
     Curriculum opponent schedule.
-    Phase 0 (R0-9):   80% self/league  20% weak
-    Phase 1 (R10-29): 65% self/league  35% weak+medium
-    Phase 2 (R30-59): 50% self/league  50% medium+strong
-    Phase 3 (R60+):   35% self/league  65% strong
+    Phase 0 (R0-9):   40% frozen, 25% league, 15% weak, 15% medium, 5% strong   → ~65% self/league, easy wins
+    Phase 1 (R10-29): 30% frozen, 20% league, 15% weak, 20% medium, 15% strong  → growing challenge
+    Phase 2 (R30-59): 20% frozen, 15% league, 10% weak, 25% medium, 30% strong  → real competition
+    Phase 3 (R60+):   15% frozen, 10% league,  5% weak, 20% medium, 50% strong  → tournament level
     """
     rng = random.Random(opp_seed)
 
     if round_idx < 10:
-        p_frozen=0.30; p_league=0.10; p_weak=0.05; p_medium=0.25; p_strong=0.30
+        p_frozen=0.40; p_league=0.25; p_weak=0.15; p_medium=0.15; p_strong=0.05
     elif round_idx < 30:
-        p_frozen=0.30; p_league=0.10; p_weak=0.05; p_medium=0.25; p_strong=0.30
-       # p_frozen=0.40; p_league=0.25; p_weak=0.15; p_medium=0.15; p_strong=0.05
+        p_frozen=0.30; p_league=0.20; p_weak=0.15; p_medium=0.20; p_strong=0.15
     elif round_idx < 60:
-        p_frozen=0.30; p_league=0.20; p_weak=0.05; p_medium=0.20; p_strong=0.25
+        p_frozen=0.20; p_league=0.15; p_weak=0.10; p_medium=0.25; p_strong=0.30
     else:
-        p_frozen=0.20; p_league=0.15; p_weak=0.00; p_medium=0.15; p_strong=0.50
+        p_frozen=0.15; p_league=0.10; p_weak=0.05; p_medium=0.20; p_strong=0.50
 
     opponents = {}
-    for pid in [p for p in range(4) if p!=controlled_id]:
+    for pid in [p for p in range(4) if p != controlled_id]:
         r = rng.random()
         cum_frozen = p_frozen
         cum_league = p_frozen + p_league
         cum_weak   = p_frozen + p_league + p_weak
         cum_medium = p_frozen + p_league + p_weak + p_medium
-        # cum_strong = 1.0
+        # remaining goes to strong
 
         if r < cum_frozen and frozen_model is not None:
-            fp = FrozenPolicyAgent(pid, frozen_model, deterministic=rng.random()<0.6)
-            fp.reset(); opponents[pid] = fp
+            fp = FrozenPolicyAgent(pid, frozen_model, deterministic=rng.random() < 0.6)
+            fp.reset()
+            opponents[pid] = fp
         elif r < cum_league and league_pool is not None and league_pool.snapshots:
             lm = league_pool.sample()
-            fp = FrozenPolicyAgent(pid, lm, deterministic=rng.random()<0.5)
-            fp.reset(); opponents[pid] = fp
+            fp = FrozenPolicyAgent(pid, lm, deterministic=rng.random() < 0.5)
+            fp.reset()
+            opponents[pid] = fp
         elif r < cum_weak:
             opponents[pid] = rng.choice(_POOL_WEAK)(pid)
         elif r < cum_medium:
@@ -714,7 +715,6 @@ def build_train_opponents(controlled_id, opp_seed, frozen_model, league_pool, ro
             opponents[pid] = rng.choice(_POOL_STRONG)(pid)
 
     return opponents
-
 # ===========================================================================
 # Reward — kill + die = 0
 # ===========================================================================
@@ -771,7 +771,7 @@ def compute_shaped_reward(prev_obs, next_obs, my_id, action, terminated, truncat
 
     if terminated or truncated:
         if my_id<len(np_) and int(np_[my_id][2])==1:
-            reward += 10.0 if int(np.sum(np_[:,2]))==1 else 0.1
+            reward += 15.0 if int(np.sum(np_[:,2]))==1 else 0.1
         # No penalty for dying at terminal: step_death already captures it
 
     return float(np.clip(reward, -6.0, 15.0))
