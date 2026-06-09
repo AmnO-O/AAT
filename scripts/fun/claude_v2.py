@@ -860,11 +860,11 @@ def _print_deployment_note():
 
 def main():
     parser = argparse.ArgumentParser(description="Train ScorerNetV2 for hybrid Bomberland agent")
-    parser.add_argument("--n-games",       type=int,  default= N_GAMES,
+    parser.add_argument("--n-games",       type=int,  default= 500,
                         help="self-play games to collect")
     parser.add_argument("--epochs",        type=int,  default=TRAIN_EPOCHS,
                         help="training epochs")
-    parser.add_argument("--rounds",        type=int,  default=1,
+    parser.add_argument("--rounds",        type=int,  default=3,
                         help="iterative refinement rounds (1 = single pass)")
     parser.add_argument("--skip-collect",  action="store_true",
                         help="skip data collection, load existing dataset")
