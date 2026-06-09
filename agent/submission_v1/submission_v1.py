@@ -201,7 +201,7 @@ def _load_scorer():
         return None
     try:
         model = ScorerNetV2()
-        model.load_state_dict(torch.load(SCORER_PATH, map_location="cpu"))
+        model.load_state_dict(torch.load(SCORER_PATH, map_location="cpu"), strict=True)
         model.eval()
         return model
     except Exception:
@@ -1084,7 +1084,7 @@ def _generate_candidates(pos, my_r, my_c, my_radius, bombs_left,
 # =============================================================================
 
 class Agent:
-    team_id = "ClaudeAgent"
+    team_id = "Submission_v2_Agent"
 
     def __init__(self, agent_id: int, verbose: bool = False):
         self.agent_id    = int(agent_id)
