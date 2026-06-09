@@ -89,7 +89,7 @@ def _try(mod, cls):
     try: return getattr(__import__(mod, fromlist=[cls]), cls)
     except: return None
 
-SamnuAgent = _try("agent.samnu_agent", "SamnuAgent")
+SamnuAgent = _try("agent.samnu_agent", "Agent")
 TacticalRuleAgent = _try("agent.tactical_rule_agent", "TacticalRuleAgent")
 GeniusRuleAgent   = _try("agent.genius_rule_agent",   "GeniusRuleAgent")
 SmarterRuleAgent  = _try("agent.smarter_rule_agent",  "SmarterRuleAgent")
