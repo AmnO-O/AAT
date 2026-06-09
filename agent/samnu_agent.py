@@ -1,24 +1,29 @@
 """
-agent.py — Bomberland Rule-Based Agent v5
-Base: v4 (v3 logic + time-expanded escape BFS with WAIT).
-Change over v4 (single, combat/economy experiment):
-  H6. Single-box bombing. BOMB_MIN_SCORE 2 -> 1 so the agent places a bomb when
-      its blast clears >=1 box OR hits an enemy (previously needed >=2 boxes).
-      The corridor penalty (-2) in _bomb_value still blocks bombing a lone box
-      in a tight corridor, and _can_escape_after_bomb still gates every bomb on
-      a verified time-expanded escape, so survival stays high.
-  Why: official ranking ties at step 500 are broken by kills > boxes > items >
-      bombs (engine match_runner.py). v4 survives often but destroys ~1.7
-      boxes/game and loses those tie-breaks. v5 destroys ~6.7 boxes/game and
-      wins far more matches in the same 4-player pool, at a small survival cost.
+agent.py -- Bomberland Rule-Based Agent v6 "Context-Aware Bombing"
+Base: v5 (single-box bombing, BOMB_MIN_SCORE=1).
+Changes over v5:
+  C1. Enemy-bomb prediction in _can_escape_after_bomb: armed enemies (Manhattan<=2,
+      bombs_left>0) are assumed to place a bomb simultaneously; their predicted
+      blast is added to the danger map before BFS escape. Prevents trap deaths.
+  C2. Combat-cluster gate: bomb threshold rises to BOMB_COMBAT_CLUSTER_SCORE=4
+      when >=2 armed enemies are within Manhattan 2. Stops escalation into cluster.
+  C3. Escape redundancy (combat_mode only): require >=2 distinct first-move
+      directions that each lead to safety before placing a bomb.
+  C4. Stuck-detector + unstuck-bomb + anti-repeat:
+      - pos_history deque(maxlen=20): detect oscillation (<=3 unique positions
+        in last 16 steps, no live bombs, not in danger).
+      - Unstuck-bomb: if stuck AND farm_mode AND box in blast AND can escape ->
+        place bomb regardless of corridor_pen / threshold.
+      - Anti-repeat: _safe_fallback penalises returning to previous cell (-15).
+  Conflict guarantee: C4b (unstuck-bomb) fires ONLY in farm_mode;
+  C2/C3 fire ONLY in combat_mode -> mutually exclusive, no interference.
 """
 import time
 from collections import deque
 
-# ─── Action constants ──────────────────────────────────────────────────────────
+# --- Action constants ---------------------------------------------------------
 STOP, LEFT, RIGHT, UP, DOWN, PLACE_BOMB = 0, 1, 2, 3, 4, 5
 
-# action → (delta_row, delta_col)  [engine/player.py verified]
 MOVES = {
     STOP:  ( 0,  0),
     LEFT:  (-1,  0),
@@ -28,26 +33,26 @@ MOVES = {
 }
 MOVE_ACTIONS = [LEFT, RIGHT, UP, DOWN]
 
-# ─── Map cell types ────────────────────────────────────────────────────────────
+# --- Map cell types -----------------------------------------------------------
 GRASS, WALL, BOX, ITEM_RADIUS, ITEM_CAPACITY = 0, 1, 2, 3, 4
 
-# ─── Game constants ────────────────────────────────────────────────────────────
+# --- Game constants -----------------------------------------------------------
 BOMB_TIMER   = 7
 MAX_RADIUS   = 5
 MAX_CAPACITY = 5
 
-# ─── Tuning ────────────────────────────────────────────────────────────────────
+# --- Tuning ------------------------------------------------------------------
 TIME_BUDGET_S  = 0.070
 BFS_DEPTH_CAP  = 30
 ESCAPE_DEPTH   = 25
-# H6: min bomb value threshold. 1 = clear a single box (open ground) or hit an
-# enemy. Corridor penalty + escape gate keep it safe.
 BOMB_MIN_SCORE = 1
+# C2: elevated threshold when >=2 armed enemies within Manhattan 2
+BOMB_COMBAT_CLUSTER_SCORE = 4
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # Geometry helpers
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 def _blast_tiles(bx, by, radius, grid):
     """Tiles in this bomb's blast zone. Stops at WALL, stops+includes BOX."""
@@ -79,15 +84,15 @@ def _walkable(r, c, grid, bomb_pos):
     return True
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # Timer-aware danger map
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 def _build_danger_timed(obs):
     """
     Returns (danger_by_time, danger_any).
     danger_by_time[t] = set of tiles whose bomb(s) explode at step t from now.
-    Chain reaction: bomb B hit by blast of A → B.effective_timer = min(A,B).
+    Chain reaction: bomb B hit by blast of A -> B.effective_timer = min(A,B).
     """
     grid    = obs["map"]
     bombs_a = obs["bombs"]
@@ -128,9 +133,9 @@ def _build_danger_timed(obs):
     return danger_by_time, danger_any
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # Timer-aware BFS
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 def _bfs_timed(start, targets, grid, bomb_pos, danger_by_time, depth_cap=BFS_DEPTH_CAP):
     """
@@ -181,18 +186,16 @@ def _bfs_timed(start, targets, grid, bomb_pos, danger_by_time, depth_cap=BFS_DEP
 def _bfs_escape(start, targets, grid, bomb_pos, danger_by_time, depth_cap=ESCAPE_DEPTH):
     """
     Time-expanded escape search (from v4).
-      - visited keyed by (row, col, time): a tile may be revisited at a later,
-        safer time slice.
-      - WAIT (STOP) allowed: staying put is valid iff the current tile is not in
-        danger at the next time slice.
-    Returns first action toward nearest reachable target (min time), or None.
+    visited keyed by (row, col, time): a tile may be revisited at a later,
+    safer time slice. WAIT (STOP) allowed.
+    Returns first action toward nearest reachable target, or None.
     """
     sr, sc = start
     if start in targets:
         return STOP
 
     visited = {(sr, sc, 0)}
-    queue   = deque([(sr, sc, None, 0)])   # (row, col, first_action, time)
+    queue   = deque([(sr, sc, None, 0)])
 
     while queue:
         r, c, first_a, t = queue.popleft()
@@ -222,12 +225,12 @@ def _bfs_escape(start, targets, grid, bomb_pos, danger_by_time, depth_cap=ESCAPE
     return None
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # Escape
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 def _escape_timed(pos, grid, bomb_pos, danger_by_time, danger_any):
-    """3-pass escape: fully safe → urgency-only → any move."""
+    """3-pass escape: fully safe -> urgency-only -> any move."""
     h, w = grid.shape
 
     safe = set()
@@ -280,12 +283,37 @@ def _escape_timed(pos, grid, bomb_pos, danger_by_time, danger_any):
     return STOP
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # Bomb helpers
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
-def _can_escape_after_bomb(my_r, my_c, my_radius, grid, bomb_pos, danger_by_time):
-    """Return True if agent can reach a safe cell within eff_t steps after placing bomb."""
+def _enemy_predicted_blast(my_r, my_c, players, agent_id, grid):
+    """
+    C1: Return union of predicted blast tiles for every armed enemy within
+    Manhattan 2 of (my_r, my_c). Simulates simultaneous enemy bombs.
+    """
+    predicted = set()
+    for i, p in enumerate(players):
+        if i == agent_id:
+            continue
+        if int(p[2]) != 1:
+            continue
+        if int(p[3]) <= 0:
+            continue
+        er, ec = int(p[0]), int(p[1])
+        if abs(er - my_r) + abs(ec - my_c) > 2:
+            continue
+        radius = max(1, min(MAX_RADIUS, 1 + int(p[4])))
+        predicted |= _blast_tiles(er, ec, radius, grid)
+    return predicted
+
+
+def _can_escape_after_bomb(my_r, my_c, my_radius, grid, bomb_pos, danger_by_time,
+                            extra_danger_tiles=None):
+    """
+    Return True if agent can reach a safe cell within eff_t steps after placing bomb.
+    C1: extra_danger_tiles (predicted enemy blasts) merged into danger at eff_t.
+    """
     new_blast  = _blast_tiles(my_r, my_c, my_radius, grid)
     new_bomb_p = set(bomb_pos) | {(my_r, my_c)}
 
@@ -298,6 +326,8 @@ def _can_escape_after_bomb(my_r, my_c, my_radius, grid, bomb_pos, danger_by_time
     if eff_t not in mod:
         mod[eff_t] = set()
     mod[eff_t] |= new_blast
+    if extra_danger_tiles:
+        mod[eff_t] |= extra_danger_tiles
 
     new_danger_any = set()
     for tiles in mod.values():
@@ -314,9 +344,8 @@ def _can_escape_after_bomb(my_r, my_c, my_radius, grid, bomb_pos, danger_by_time
     if not safe_cells:
         return False
 
-    # Time-expanded search with WAIT, mirroring _bfs_escape.
     visited = {(my_r, my_c, 0)}
-    queue   = deque([(my_r, my_c, 0)])   # (row, col, time)
+    queue   = deque([(my_r, my_c, 0)])
 
     while queue:
         r, c, t = queue.popleft()
@@ -344,9 +373,96 @@ def _can_escape_after_bomb(my_r, my_c, my_radius, grid, bomb_pos, danger_by_time
     return False
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Hypothesis C: Anti-corner — reachable safe count
-# ══════════════════════════════════════════════════════════════════════════════
+def _count_escape_first_moves(my_r, my_c, my_radius, grid, bomb_pos, danger_by_time,
+                               extra_danger_tiles=None):
+    """
+    C3: Count distinct first-move directions that lead to a safe cell after
+    placing a bomb. Uses same modified danger map as _can_escape_after_bomb.
+    Returns int 0..5.
+    """
+    new_blast  = _blast_tiles(my_r, my_c, my_radius, grid)
+    new_bomb_p = set(bomb_pos) | {(my_r, my_c)}
+
+    eff_t = BOMB_TIMER - 1
+    for t, tiles in danger_by_time.items():
+        if (my_r, my_c) in tiles and t < eff_t:
+            eff_t = t
+
+    mod = {t: set(s) for t, s in danger_by_time.items()}
+    if eff_t not in mod:
+        mod[eff_t] = set()
+    mod[eff_t] |= new_blast
+    if extra_danger_tiles:
+        mod[eff_t] |= extra_danger_tiles
+
+    new_danger_any = set()
+    for tiles in mod.values():
+        new_danger_any |= tiles
+
+    h, w = grid.shape
+    safe_cells = set()
+    for rr in range(h):
+        for cc in range(w):
+            if grid[rr, cc] not in (WALL, BOX) and (rr, cc) not in new_bomb_p \
+                    and (rr, cc) not in new_danger_any:
+                safe_cells.add((rr, cc))
+
+    if not safe_cells:
+        return 0
+
+    count = 0
+    for first_a in (LEFT, RIGHT, UP, DOWN, STOP):
+        if first_a == STOP:
+            r1, c1 = my_r, my_c
+        else:
+            dr, dc = MOVES[first_a]
+            r1, c1 = my_r + dr, my_c + dc
+            if not _walkable(r1, c1, grid, new_bomb_p):
+                continue
+
+        if (r1, c1) in mod.get(1, set()):
+            continue
+
+        if (r1, c1) in safe_cells:
+            count += 1
+            continue
+
+        visited2 = {(r1, c1, 1)}
+        queue2   = deque([(r1, c1, 1)])
+        found    = False
+        while queue2 and not found:
+            r, c, t = queue2.popleft()
+            if t >= eff_t:
+                continue
+            t_next = t + 1
+            danger_next = mod.get(t_next, set())
+            for a2 in (LEFT, RIGHT, UP, DOWN, STOP):
+                if a2 == STOP:
+                    nr, nc = r, c
+                else:
+                    dr2, dc2 = MOVES[a2]
+                    nr, nc = r + dr2, c + dc2
+                    if not _walkable(nr, nc, grid, new_bomb_p):
+                        continue
+                if (nr, nc, t_next) in visited2:
+                    continue
+                if (nr, nc) in danger_next:
+                    continue
+                if (nr, nc) in safe_cells:
+                    found = True
+                    break
+                visited2.add((nr, nc, t_next))
+                queue2.append((nr, nc, t_next))
+
+        if found:
+            count += 1
+
+    return count
+
+
+# =============================================================================
+# Reachable safe count (anti-corner)
+# =============================================================================
 
 def _reachable_safe_count(pos, grid, bomb_pos, danger_any, depth=4):
     """
@@ -370,15 +486,17 @@ def _reachable_safe_count(pos, grid, bomb_pos, danger_any, depth=4):
     return count
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Safe fallback (anti-corner)
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# Safe fallback (anti-corner + C4c anti-repeat)
+# =============================================================================
 
-def _safe_fallback(pos, grid, bomb_pos, danger_by_time, step_count, agent_id):
+def _safe_fallback(pos, grid, bomb_pos, danger_by_time, step_count, agent_id,
+                   last_pos=None):
     """
     Primary score = reachable_safe_count(depth=4) * 10 + open_neighbors.
     Hard-skip dead-end moves (open_neighbors <= 1) unless all moves are dead-ends.
     Prefer non-STOP; deterministic tiebreak.
+    C4c: penalise returning to last_pos by -15 (anti-oscillation).
     """
     sr, sc = pos
     imm_danger = danger_by_time.get(1, set())
@@ -392,13 +510,14 @@ def _safe_fallback(pos, grid, bomb_pos, danger_by_time, step_count, agent_id):
             1 for dr2, dc2 in ((-1,0),(1,0),(0,-1),(0,1))
             if _walkable(r+dr2, c+dc2, grid, bomb_pos)
         )
-        penalty = 5 if (r, c) in any_danger else 0
-        tb      = (step_count * 13 + agent_id * 7 + r * 5 + c * 3 + a * 11) % 97
-        return reach * 10 + open_n - penalty, open_n, tb
+        penalty    = 5 if (r, c) in any_danger else 0
+        repeat_pen = 15 if (not is_stop) and last_pos is not None \
+                          and (r, c) == last_pos else 0
+        tb = (step_count * 13 + agent_id * 7 + r * 5 + c * 3 + a * 11) % 97
+        return reach * 10 + open_n - penalty - repeat_pen, open_n, tb
 
     candidates = []
 
-    # STOP candidate
     if (sr, sc) not in imm_danger:
         sc_score, sc_open, sc_tb = _score(sr, sc, True, STOP)
         candidates.append((STOP, sc_score, True, sc_open, sc_tb))
@@ -417,7 +536,6 @@ def _safe_fallback(pos, grid, bomb_pos, danger_by_time, step_count, agent_id):
         else:
             candidates.append((a, mv_score, False, mv_open, mv_tb))
 
-    # If all moves are dead-ends, allow them as last resort
     if not candidates:
         candidates = dead_end_candidates
 
@@ -432,9 +550,9 @@ def _safe_fallback(pos, grid, bomb_pos, danger_by_time, step_count, agent_id):
     return pool[0][0]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # Bomb value scoring
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 def _bomb_value(my_r, my_c, my_radius, grid, players, agent_id, danger_any):
     """
@@ -451,7 +569,6 @@ def _bomb_value(my_r, my_c, my_radius, grid, players, agent_id, danger_any):
         and int(players[i][2]) == 1
         and (int(players[i][0]), int(players[i][1])) in blast
     )
-    # Corridor penalty: if agent has <= 1 safe adjacent cell (excluding bomb cell)
     h, w = grid.shape
     adj_safe = sum(
         1 for dr, dc in ((-1,0),(1,0),(0,-1),(0,1))
@@ -464,34 +581,52 @@ def _bomb_value(my_r, my_c, my_radius, grid, players, agent_id, danger_any):
     return score, boxes > 0, enemies > 0
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Enemy proximity check
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# Enemy proximity helpers
+# =============================================================================
 
 def _enemy_adjacent(my_r, my_c, players, agent_id):
-    """True if any live enemy with bombs_left > 0 is adjacent (Manhattan dist <= 2)."""
+    """True if any live enemy with bombs_left > 0 is adjacent (Manhattan <= 2)."""
     for i, p in enumerate(players):
         if i == agent_id:
             continue
         if int(p[2]) != 1:
             continue
         if int(p[3]) <= 0:
-            continue   # no bombs left
+            continue
         er, ec = int(p[0]), int(p[1])
         if abs(er - my_r) + abs(ec - my_c) <= 2:
             return True
     return False
 
 
+def _count_nearby_armed(my_r, my_c, players, agent_id):
+    """Count live enemies with bombs_left > 0 within Manhattan 2."""
+    count = 0
+    for i, p in enumerate(players):
+        if i == agent_id:
+            continue
+        if int(p[2]) != 1:
+            continue
+        if int(p[3]) <= 0:
+            continue
+        er, ec = int(p[0]), int(p[1])
+        if abs(er - my_r) + abs(ec - my_c) <= 2:
+            count += 1
+    return count
 
-# ══════════════════════════════════════════════════════════════════════════════
+
+# =============================================================================
 # Agent
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 class Agent:
     def __init__(self, agent_id: int):
-        self.agent_id   = int(agent_id)
-        self.step_count = 0
+        self.agent_id    = int(agent_id)
+        self.step_count  = 0
+        # C4: history for stuck detection and anti-repeat
+        self.pos_history = deque(maxlen=20)
+        self.last_pos    = None  # position at previous step (for anti-repeat)
 
     def act(self, obs: dict) -> int:
         try:
@@ -509,7 +644,7 @@ class Agent:
         players = obs["players"]
         bombs_a = obs["bombs"]
 
-        # ── My state ──────────────────────────────────────────────────────────
+        # My state
         me = players[self.agent_id]
         my_r, my_c   = int(me[0]), int(me[1])
         alive        = int(me[2])
@@ -522,20 +657,43 @@ class Agent:
         my_radius = max(1, min(MAX_RADIUS, 1 + radius_bonus))
         pos       = (my_r, my_c)
 
-        # ── Timer-aware danger map ────────────────────────────────────────────
+        # C4: update position history; capture prev_pos for anti-repeat
+        self.pos_history.append(pos)
+        prev_pos      = self.last_pos  # where we were last step
+        self.last_pos = pos            # will be prev_pos on next step
+
+        # Timer-aware danger map
         danger_by_time, danger_any = _build_danger_timed(obs)
 
-        # ── Bomb positions ────────────────────────────────────────────────────
+        # Bomb positions
         bomb_pos = {(int(b[0]), int(b[1])) for b in bombs_a}
 
-        # ── PRIORITY 1: ESCAPE ────────────────────────────────────────────────
+        # C2/C3: combat mode detection
+        nearby_armed = _count_nearby_armed(my_r, my_c, players, self.agent_id)
+        combat_mode  = nearby_armed >= 1
+
+        # C1: predict enemy blasts (only when in combat_mode)
+        extra_danger = set()
+        if combat_mode:
+            extra_danger = _enemy_predicted_blast(
+                my_r, my_c, players, self.agent_id, grid)
+
+        # C4a: stuck detection (farm_mode only -- no bombs on map, not in danger)
+        is_stuck = (
+            len(self.pos_history) >= 16
+            and len(set(self.pos_history)) <= 3
+            and len(bombs_a) == 0
+            and pos not in danger_any
+        )
+
+        # PRIORITY 1: ESCAPE
         in_immediate = pos in danger_by_time.get(1, set())
         in_any       = pos in danger_any
 
         if in_immediate or in_any:
             return _escape_timed(pos, grid, bomb_pos, danger_by_time, danger_any)
 
-        # ── PRIORITY 2: PICK UP ITEM ──────────────────────────────────────────
+        # PRIORITY 2: PICK UP ITEM
         if time.perf_counter() - t0 < TIME_BUDGET_S:
             h, w = grid.shape
             items = {(r, c) for r in range(h) for c in range(w)
@@ -545,17 +703,42 @@ class Agent:
                 if a is not None and a != STOP:
                     return a
 
-        # ── PRIORITY 3: PLACE BOMB (scored + threshold) ───────────────────────
+        # C4b: UNSTUCK BOMB (farm_mode only -- never in combat_mode)
+        if is_stuck and not combat_mode and bombs_left > 0 and pos not in bomb_pos:
+            if time.perf_counter() - t0 < TIME_BUDGET_S:
+                blast   = _blast_tiles(my_r, my_c, my_radius, grid)
+                has_box = any(grid[r][c] == BOX for r, c in blast)
+                if has_box and _can_escape_after_bomb(
+                        my_r, my_c, my_radius, grid, bomb_pos, danger_by_time,
+                        extra_danger_tiles=None):
+                    return PLACE_BOMB
+
+        # PRIORITY 3: PLACE BOMB (scored + threshold + C1/C2/C3 gates)
         if bombs_left > 0 and pos not in bomb_pos:
             if time.perf_counter() - t0 < TIME_BUDGET_S:
                 bval, hits_box, hits_enemy = _bomb_value(
                     my_r, my_c, my_radius, grid, players, self.agent_id, danger_any)
-                if bval >= BOMB_MIN_SCORE and (hits_box or hits_enemy):
-                    if _can_escape_after_bomb(my_r, my_c, my_radius, grid,
-                                              bomb_pos, danger_by_time):
+
+                # C2: raise threshold in combat cluster (>=2 armed enemies nearby)
+                threshold = BOMB_COMBAT_CLUSTER_SCORE if nearby_armed >= 2 \
+                            else BOMB_MIN_SCORE
+
+                if bval >= threshold and (hits_box or hits_enemy):
+                    # C1: escape gate includes predicted enemy blasts
+                    can_esc = _can_escape_after_bomb(
+                        my_r, my_c, my_radius, grid, bomb_pos, danger_by_time,
+                        extra_danger_tiles=extra_danger)
+
+                    # C3: in combat_mode require >=2 distinct escape first-moves
+                    if can_esc and combat_mode:
+                        can_esc = _count_escape_first_moves(
+                            my_r, my_c, my_radius, grid, bomb_pos, danger_by_time,
+                            extra_danger_tiles=extra_danger) >= 2
+
+                    if can_esc:
                         return PLACE_BOMB
 
-        # ── PRIORITY 4: FARM BOXES — navigate to box-adjacent safe spot ───────
+        # PRIORITY 4: FARM BOXES -- navigate to box-adjacent safe spot
         if time.perf_counter() - t0 < TIME_BUDGET_S:
             h, w = grid.shape
             box_spots = set()
@@ -576,7 +759,7 @@ class Agent:
                 if a is not None and a != STOP:
                     return a
 
-        # ── PRIORITY 5: CHASE NEAREST ENEMY (skip if dangerous) ───────────────
+        # PRIORITY 5: CHASE NEAREST ENEMY (skip if dangerous)
         if time.perf_counter() - t0 < TIME_BUDGET_S:
             if not _enemy_adjacent(my_r, my_c, players, self.agent_id):
                 enemies = {
@@ -589,6 +772,6 @@ class Agent:
                     if a is not None and a != STOP:
                         return a
 
-        # ── FALLBACK: anti-corner safe move ───────────────────────────────────
+        # FALLBACK: anti-corner safe move (C4c: pass prev_pos for anti-repeat)
         return _safe_fallback(pos, grid, bomb_pos, danger_by_time,
-                              self.step_count, self.agent_id)
+                              self.step_count, self.agent_id, last_pos=prev_pos)

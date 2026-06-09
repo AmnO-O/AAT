@@ -155,11 +155,56 @@ class StageConfig:
     maxr:       int             # force-advance after this many rounds in stage
 
 
+def print_ascii_map(obs_data, player_pos):
+    """
+    Hàm vẽ lại bản đồ dựa trên định dạng mảng NumPy của obs.
+    obs_data: dict chứa obs["map"] và obs["bombs"]
+    player_pos: tuple (row, col) - Vị trí hiện tại của Agent
+    """
+    grid = obs_data["map"]       # Ma trận (13, 13)
+    bombs = obs_data["bombs"]     # Mảng (N, 4) chứa thông tin bom
+    
+    height, width = grid.shape   # Lấy kích thước 13x13
+    p_row, p_col = player_pos    # Tọa độ hiện tại là (hàng, cột)
+
+    # Tạo một tập hợp các tọa độ (row, col) đang có bom để tra cứu nhanh
+    bomb_positions = set()
+    if bombs is not None and len(bombs) > 0:
+        for b in bombs:
+            # b là một mảng/list chứa [row, col, timer, owner_id]
+            bomb_positions.add((int(b[0]), int(b[1])))
+
+    print("\n--- BẢN ĐỒ CHI TIẾT (13x13) ---")
+    for r in range(height):
+        row_str = ""
+        for c in range(width):
+            cell_type = grid[r][c]
+            
+            # Thứ tự ưu tiên hiển thị tại ô (r, c)
+            if (r, c) == (p_row, p_col):
+                row_str += "🤖 "  # Agent của bạn (Player)
+            elif (r, c) in bomb_positions:
+                row_str += "💣 "  # Quả bom đang nằm trên sân
+            elif cell_type == 1:
+                row_str += "🧱 "  # Tường đá (Wall)
+            elif cell_type == 2:
+                row_str += "📦 "  # Thùng gỗ (Box)
+            elif cell_type == 3:
+                row_str += "🔥 "  # Item tăng độ dài lửa (rad_item)
+            elif cell_type == 4:
+                row_str += "🎒 "  # Item tăng số lượng bom (cap_item)
+            elif cell_type == 0:
+                row_str += "░░ "  # Cỏ / Đường trống (Grass)
+            else:
+                row_str += "❓ "  # Vật thể lạ nếu có
+        print(row_str)
+    print("--------------------------------")
+    
 STAGES: List[StageConfig] = [
     # ── Stage 0: Solo Farming ─────────────────────────────────────────────
     StageConfig(
         name="solo_farming", n_opp=0, teacher="SamnuAgent",
-        n_demo=200,  bc_pretrain=5000,
+        n_demo=2,  bc_pretrain=5000,
         bc0=0.30, bcmin=0.05, bcd=0.85,
         tp0=0.50, tpmin=0.10, tpd=0.88,
         pool="stop",
@@ -925,6 +970,16 @@ def collect_teacher_demos(teacher_cls, cfg: StageConfig) -> DemoBuffer:
                 state = encode_obs(obs["map"],obs["players"],obs["bombs"],cid,step).numpy()
                 buf.add(state, t_act)
             else:
+                action_names = {0: "STAY", 1: "UP", 2: "DOWN", 3: "LEFT", 4: "RIGHT", 5: "BOMB"}
+                act_name = action_names.get(t_act, f"UNKNOWN({t_act})")
+                
+                print(f"\n[ILLEGAL TEACHER] Game: {gi+1}/{cfg.n_demo} | Step: {step}")
+                print(f"Vị trí: {pos} | Bom còn: {bl_} | Teacher chọn: {act_name} | Mask: {lm}")
+                
+                # ─── GỌI HÀM IN BẢN ĐỒ ĐÃ CẬP NHẬT ───
+                print_ascii_map(obs, pos)
+                # ───────────────
+                # ──────────────────────────────────────
                 skipped += 1
 
             acts=[0]*4; acts[cid]=t_act
@@ -1471,9 +1526,9 @@ def main():
 
     # ── Initial diagnostics ───────────────────────────────────────────────
     print("\n═══ Initial diagnostics ═══", flush=True)
-    evaluate_boxes(model, n=10, label="Init-Solo")
-    evaluate_1v1(model,  n=10, label="Init-1v1")
-    evaluate_full(model, n=10, label="Init-Full")
+    #evaluate_boxes(model, n=10, label="Init-Solo")
+    #evaluate_1v1(model,  n=10, label="Init-1v1")
+    #evaluate_full(model, n=10, label="Init-Full")
 
     print(f"\n═══ Curriculum training ({MAX_TOTAL_ROUNDS} total rounds) ═══\n",
           flush=True)
