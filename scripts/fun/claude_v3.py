@@ -107,7 +107,7 @@ from agent.submission_v1.submission_v1 import (
     MAX_RADIUS, MAX_CAPACITY, BOMB_TIMER,
     GRASS, WALL, BOX, ITEM_RADIUS, ITEM_CAPACITY,
     STATE_DIM, CAND_DIM, TOTAL_IN_DIM,
-    ScorerNet,
+    ScorerNetV2,
     TIME_BUDGET_S,
 )
 
