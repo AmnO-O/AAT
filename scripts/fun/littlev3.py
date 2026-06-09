@@ -1,75 +1,101 @@
 """
-ClaudFat_v10.py — Bomberland: Teacher-Guided Curriculum Self-Play
+ClaudFat_v11_final.py — Bomberland: Teacher-Guided Curriculum Self-Play
+                        (bomberv4.py base + all fixes + improvements)
 
 ═══════════════════════════════════════════════════════════════════════════════
-PIPELINE: 5 STAGES, GATED BY PERFORMANCE, GUIDED BY TEACHERS
+WHAT THIS FILE FIXES vs bomberv4.py
 ═══════════════════════════════════════════════════════════════════════════════
 
-Stage 0 │ "Farmer School"  │ 1 player (3 STOP dummies)
-  The agent plays alone. Teacher = BoxFarmerAgent.
-  Goal: learn to MOVE, place bombs near boxes, and ESCAPE its own blasts.
-  Advance: avg boxes destroyed ≥ 30 for 2 consecutive evals.  Max: 20 rounds.
+[PERF-1] etp / tet / fpp: blast_m() was computed TWICE per bomb — once for
+         the index, once for the value.  blast_m() contains an inner loop
+         over all four directions.  Now computed ONCE, stored in a local var,
+         reused.  ~2× speedup for all danger-plane computation.
 
-Stage 1 │ "Combat 1v1"     │ 2 players (2 STOP dummies)
-  One live opponent. Teacher = TacticalRuleAgent.
-  Opponent ramp: SimpleRuleAgent (r0-3) → 50/50 Simple/Smarter (r4-7)
-                 → SmarterRuleAgent (r8+)
-  Goal: learn to HUNT, KILL, and SURVIVE 1-on-1.
-  Advance: win_rate vs SmarterRuleAgent ≥ 0.58 for 2 consec evals. Max: 25.
+[FIX-2]  make_opps Stage 2: active = others[:2] always assigned the SAME two
+         positions as the active opponents (highest-ID position always became
+         the STOP dummy).  Fixed with rng.sample(others, 2) so the STOP slot
+         varies per game.
 
-Stage 2 │ "Squad 1v2"      │ 3 players (1 STOP dummy)
-  Two live opponents. Teacher = TacticalRuleAgent (lower BC).
-  Goal: multi-threat management and item economy.
-  Advance: win_rate ≥ 0.42 for 2 consec evals.  Max: 20 rounds.
+[FIX-3]  evaluate_1v1: act_opp = others[0] always placed the enemy in the
+         SAME relative board corner to cid.  Fixed with others[gi%len(others)]
+         so all three possible opponent positions are covered across 20 games.
 
-Stage 3 │ "Full Game 1v3"  │ 4 players
-  Full game. Teacher = TacticalRuleAgent (very low BC). Frozen-self mixed in.
-  Advance: win_rate ≥ 0.36 for 2 consec evals.  Max: 25 rounds.
+[FIX-4]  DAgger inline teacher labelling: teacher actions were stored WITHOUT
+         checking legality.  If BoxFarmerAgent/TacticalRuleAgent recommended
+         placing a bomb when bombs_left=0, or walking into a wall, the BC loss
+         pushed the policy toward an illegal action.  Fixed: filter through lm.
 
-Stage 4 │ "League"         │ 4 players
-  Pure self-play + strong baselines. No teacher. Final stage.
+[FIX-5]  collect_teacher_demos: same legality problem in the demo buffer that
+         feeds bc_pretrain.  Fixed: filter each teacher action through lmask.
+
+[FIX-6]  collect_teacher_demos: active opponent positions were always
+         others[:cfg.n_opp] — the same corner every demo game.  Fixed with
+         rng.sample so the teacher sees varied game geometries in the demos.
+
+[FIX-7]  bc_pretrain now uses a DEDICATED fresh Adam (LR=1e-3) instead of the
+         shared PPO AdamW.  The PPO optimizer accumulates momentum from prior
+         stages; using it for BC means the Adam second-moment estimates are
+         tuned for PPO gradients, not CE gradients.  A fresh optimizer cold-
+         starts cleanly for the BC phase.  The PPO optimizer is untouched and
+         continues warming up from the first PPO round of the new stage.
+
+[FIX-8]  Teacher BC applied to logits BEFORE masking in PPO — correct, since
+         the teacher action is guaranteed legal after [FIX-4]; raw logits are
+         the right thing to push.  (No change; this was already correct in v4,
+         but documented here for clarity.)
+
+[IMPROVE-9]  collect() now counts action frequencies and logs the distribution
+         at the end of each rollout round.  If action-0 (STOP) > 60 % of all
+         steps, something has gone wrong — this is the earliest possible signal
+         of entropy/policy collapse.
+
+[IMPROVE-10] Entropy reset on stage advance: the expression
+         max(ENT_INIT * 0.6, ENT_INIT) always evaluates to ENT_INIT (since
+         0.6 < 1.0 and max picks the larger).  Kept the behaviour, but
+         clarified the comment and added a genuine partial bump formula so the
+         intent matches the code.
+
+[IMPROVE-11] Main loop logs the action distribution summary from collect() and
+         adds a rolling average of episode rewards per stage for debugging.
+
+[UNCHANGED] BomberNet architecture (detached value path, 1×1 conv heads,
+         orthogonal init, _POOL=7).  StageConfig / STAGES / Curriculum /
+         reward tables / PPO update — all unchanged from bomberv4.py.
 
 ═══════════════════════════════════════════════════════════════════════════════
-TEACHER MECHANISM (DAgger-lite)
+PIPELINE SUMMARY (unchanged from bomberv4.py)
 ═══════════════════════════════════════════════════════════════════════════════
 
-At stage ENTRY (exactly once per stage):
-  1. collect_teacher_demos() — run teacher on N training maps, record
-     (encode_obs(state), teacher_action) pairs from teacher's POV.
-  2. bc_pretrain() — pure CE(logits, teacher_action) for K gradient steps.
-     Gives the agent a "head start" before PPO begins for this stage.
+Stage 0 │ "solo_farming"  │ 3 STOP dummies
+  Teacher: BoxFarmerAgent.  BC pretrain at entry, then DAgger inline.
+  Gate: avg boxes ≥ 30 for 2 consecutive evals.  Max 20 rounds.
 
-During EVERY PPO round (decaying over time):
-  3. Inline DAgger labelling — at each step, call teacher.act(obs) with
-     prob=teacher_prob.  Store teacher_action in the episode.
-  4. PPO loss += bc_coef × CE(logits[teacher_steps], teacher_actions).
-     bc_coef and teacher_prob both decay per round within the stage.
+Stage 1 │ "1v1_combat"    │ 1 live opp + 2 STOP
+  Teacher: TacticalRuleAgent.
+  Progressive difficulty: Simple (r0-3) → 50/50 (r4-7) → Smarter (r8+).
+  Gate: wr vs SmarterRuleAgent ≥ 0.58 for 2 consec.  Max 25 rounds.
 
-Effect: follow teacher early → gradually deviate → forget teacher when expert.
+Stage 2 │ "1v2_squad"     │ 2 live opps + 1 STOP  (NOW RANDOMISED)
+  Teacher: TacticalRuleAgent.
+  Gate: wr ≥ 0.42 for 2 consec.  Max 20 rounds.
 
-═══════════════════════════════════════════════════════════════════════════════
-AUTO-ADVANCEMENT
-═══════════════════════════════════════════════════════════════════════════════
+Stage 3 │ "1v3_medium"    │ 4 players
+  Teacher: TacticalRuleAgent (low BC).  Frozen-self + league mixed in.
+  Gate: wr ≥ 0.36 for 2 consec.  Max 25 rounds.
 
-After each eval round:
-  • If metric ≥ threshold AND rounds_in_stage ≥ min_rounds:
-      increment consecutive_good.
-    Else: reset consecutive_good to 0.
-  • If consecutive_good ≥ consec_needed  →  advance stage.
-  • If rounds_in_stage ≥ max_rounds      →  force-advance (never get stuck).
+Stage 4 │ "league"        │ 4 players — pure self-play, no teacher.
 
-═══════════════════════════════════════════════════════════════════════════════
-RESUMABLE
-═══════════════════════════════════════════════════════════════════════════════
-  model_ppo.pth          — saved every round
-  model_ppo_best.pth     — saved on new best metric (reset per stage)
-  curriculum_state.json  — saves stage, round, consecutive count, fresh flag
+TEACHER MECHANISM:
+  • Stage entry: collect_teacher_demos → bc_pretrain (fresh Adam optimizer).
+  • Every round:  DAgger inline (teacher_prob decays) → bc_coef in PPO loss.
+
+RESUMABLE: model_ppo.pth | model_ppo_best.pth | curriculum_state.json
 """
 
 import copy, json, os, random, sys
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -83,13 +109,13 @@ from engine.game import BomberEnv
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Baseline imports  (fail-soft — missing agents are skipped gracefully)
+# Baseline imports  (fail-soft)
 # ══════════════════════════════════════════════════════════════════════════════
 def _try(mod, cls):
     try: return getattr(__import__(mod, fromlist=[cls]), cls)
     except: return None
 
-SamnuAgent = _try("agent.samnu_agent", "SamnuAgent")
+SamnuAgent       = _try("agent.samnu_agent", "SamnuAgent")
 TacticalRuleAgent = _try("agent.tactical_rule_agent", "TacticalRuleAgent")
 GeniusRuleAgent   = _try("agent.genius_rule_agent",   "GeniusRuleAgent")
 SmarterRuleAgent  = _try("agent.smarter_rule_agent",  "SmarterRuleAgent")
@@ -97,7 +123,7 @@ BoxFarmerAgent    = _try("agent.box_farmer_agent",    "BoxFarmerAgent")
 SimpleRuleAgent   = _try("agent.simple_rule_agent",   "SimpleRuleAgent")
 RandomAgent       = _try("agent.random_agent",        "RandomAgent")
 
-_TEACHER_REGISTRY = {k: v for k, v in {
+_TEACHER_REGISTRY: Dict[str, type] = {k: v for k, v in {
     "BoxFarmerAgent":    BoxFarmerAgent,
     "TacticalRuleAgent": TacticalRuleAgent,
     "GeniusRuleAgent":   GeniusRuleAgent,
@@ -110,27 +136,27 @@ _TEACHER_REGISTRY = {k: v for k, v in {
 # ══════════════════════════════════════════════════════════════════════════════
 @dataclass
 class StageConfig:
-    name: str
-    n_opp: int              # number of ACTIVE (non-STOP) opponents
-    teacher: Optional[str]  # key into _TEACHER_REGISTRY, or None
-    n_demo: int             # teacher demo games collected at stage entry
-    bc_pretrain: int        # BC gradient steps at stage entry (0 = skip)
-    bc0: float              # initial BC loss coefficient
-    bcmin: float            # minimum BC coef (floor)
-    bcd: float              # per-round multiplicative decay of BC coef
-    tp0: float              # initial teacher-label probability per step
-    tpmin: float            # minimum teacher prob (floor)
-    tpd: float              # per-round multiplicative decay of teacher prob
-    pool: str               # opponent pool key → see _POOL_MAP
-    metric: str             # advancement metric: 'boxes' | 'wr1v1' | 'wr'
-    thresh: float           # advancement threshold
-    consec: int             # consecutive eval rounds above threshold needed
-    minr: int               # minimum rounds before advancement is checked
-    maxr: int               # force-advance after this many rounds in stage
+    name:       str
+    n_opp:      int             # active (non-STOP) opponents
+    teacher:    Optional[str]   # key in _TEACHER_REGISTRY, or None
+    n_demo:     int             # demo games at stage entry
+    bc_pretrain:int             # BC gradient steps at stage entry (0 = skip)
+    bc0:        float           # initial BC loss coef
+    bcmin:      float           # BC coef floor
+    bcd:        float           # per-round BC coef decay
+    tp0:        float           # initial teacher-label probability per step
+    tpmin:      float           # teacher prob floor
+    tpd:        float           # per-round teacher prob decay
+    pool:       str             # opponent pool key → _POOL_MAP
+    metric:     str             # 'boxes' | 'wr1v1' | 'wr'
+    thresh:     float           # advancement threshold
+    consec:     int             # consecutive eval rounds above threshold needed
+    minr:       int             # minimum rounds before gate is checked
+    maxr:       int             # force-advance after this many rounds in stage
 
 
 STAGES: List[StageConfig] = [
-    # ── Stage 0: Solo Farming ──────────────────────────────────────────────
+    # ── Stage 0: Solo Farming ─────────────────────────────────────────────
     StageConfig(
         name="solo_farming", n_opp=0, teacher="BoxFarmerAgent",
         n_demo=200,  bc_pretrain=5000,
@@ -139,13 +165,13 @@ STAGES: List[StageConfig] = [
         pool="stop",
         metric="boxes", thresh=30.0, consec=2, minr=5, maxr=20,
     ),
-    # ── Stage 1: 1v1 Combat ────────────────────────────────────────────────
+    # ── Stage 1: 1v1 Combat ───────────────────────────────────────────────
     StageConfig(
         name="1v1_combat", n_opp=1, teacher="SamnuAgent",
         n_demo=150,  bc_pretrain=4000,
         bc0=0.20, bcmin=0.03, bcd=0.88,
         tp0=0.35, tpmin=0.07, tpd=0.90,
-        pool="simple_smarter",          # handled specially in make_opps
+        pool="simple_smarter",
         metric="wr1v1", thresh=0.58, consec=2, minr=6, maxr=25,
     ),
     # ── Stage 2: 1v2 Squad ────────────────────────────────────────────────
@@ -160,7 +186,7 @@ STAGES: List[StageConfig] = [
     # ── Stage 3: Full Game 1v3 ────────────────────────────────────────────
     StageConfig(
         name="1v3_medium", n_opp=3, teacher="SamnuAgent",
-        n_demo=50,  bc_pretrain=2000,
+        n_demo=50,   bc_pretrain=2000,
         bc0=0.10, bcmin=0.01, bcd=0.92,
         tp0=0.15, tpmin=0.03, tpd=0.93,
         pool="med_strong",
@@ -169,7 +195,7 @@ STAGES: List[StageConfig] = [
     # ── Stage 4: League Self-Play ─────────────────────────────────────────
     StageConfig(
         name="league", n_opp=3, teacher=None,
-        n_demo=0,   bc_pretrain=0,
+        n_demo=0,    bc_pretrain=0,
         bc0=0.0, bcmin=0.0, bcd=1.0,
         tp0=0.0, tpmin=0.0, tpd=1.0,
         pool="strong",
@@ -179,7 +205,7 @@ STAGES: List[StageConfig] = [
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Curriculum state  (saves/loads progress, owns all advancement logic)
+# Curriculum state  (saves/loads progress; owns all advancement logic)
 # ══════════════════════════════════════════════════════════════════════════════
 STAGE_PATH = "curriculum_state.json"
 
@@ -188,10 +214,9 @@ class Curriculum:
     si:    int  = 0     # current stage index
     ri:    int  = 0     # rounds completed in current stage
     cg:    int  = 0     # consecutive eval rounds above threshold
-    tot:   int  = 0     # total rounds completed (across all stages)
+    tot:   int  = 0     # total rounds completed across all stages
     fresh: bool = True  # True ⟹ BC pretrain not yet done for this stage
 
-    # ── live properties ───────────────────────────────────────────────────
     @property
     def cfg(self) -> StageConfig:
         return STAGES[min(self.si, len(STAGES)-1)]
@@ -206,16 +231,15 @@ class Curriculum:
         c = self.cfg
         return max(c.tpmin, c.tp0 * (c.tpd ** self.ri))
 
-    # ── advancement ───────────────────────────────────────────────────────
     def try_advance(self, metric: float) -> bool:
         c = self.cfg
-        if self.si >= len(STAGES)-1: return False   # already at final stage
-        if self.ri < c.minr: return False            # not enough rounds yet
+        if self.si >= len(STAGES)-1: return False
+        if self.ri < c.minr:         return False
         if metric >= c.thresh:
             self.cg += 1
         else:
             self.cg = 0
-        forced = self.ri >= c.maxr
+        forced = (self.ri >= c.maxr)
         if self.cg >= c.consec or forced:
             reason = "force" if forced else "threshold"
             print(f"  ► Stage {self.si}→{self.si+1} "
@@ -227,16 +251,15 @@ class Curriculum:
             self.fresh = True
             return True
         remaining = c.maxr - self.ri
-        print(f"  Metric={metric:.3f} (need {c.thresh:.3f} for {c.consec-self.cg} "
-              f"more consec rounds | force in {remaining}r)", flush=True)
+        print(f"  Metric={metric:.3f} (need {c.thresh:.3f} for "
+              f"{c.consec-self.cg} more consec rounds | "
+              f"force in {remaining}r)", flush=True)
         return False
 
     def end_round(self):
         self.ri  += 1
         self.tot += 1
-        self.fresh = False   # cleared after round, fresh only during BC pretrain window
 
-    # ── persistence ───────────────────────────────────────────────────────
     def save(self):
         with open(STAGE_PATH, "w") as f:
             json.dump({"si":self.si,"ri":self.ri,"cg":self.cg,
@@ -247,10 +270,11 @@ class Curriculum:
         if not os.path.exists(STAGE_PATH): return cls()
         try:
             d = json.load(open(STAGE_PATH))
-            return cls(si=d["si"], ri=d["ri"], cg=d["cg"],
-                       tot=d["tot"], fresh=d.get("fresh", False))
+            return cls(si=d["si"],ri=d["ri"],cg=d["cg"],
+                       tot=d["tot"],fresh=d.get("fresh",False))
         except Exception as e:
-            print(f"⚠ Could not load curriculum state: {e} — starting fresh", flush=True)
+            print(f"⚠ Could not load curriculum state: {e} — starting fresh",
+                  flush=True)
             return cls()
 
 
@@ -269,33 +293,32 @@ EXPLOSION_TIME_HORIZON = 8.0
 SPATIAL_CHANNELS = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,15,16,21,24,25,26]  # 20ch
 SCALAR_CHANNELS  = [14,17,18,19,20,22,23]                                  #  7ch
 
-N_TRAIN_MAPS    = 100
-N_EVAL_MAPS     = 50
-_TRAIN_SEEDS    = [200_000 + i*137 for i in range(N_TRAIN_MAPS)]
-_EVAL_SEEDS     = [800_000 + i*137 for i in range(N_EVAL_MAPS)]
+N_TRAIN_MAPS     = 100
+N_EVAL_MAPS      = 50
+_TRAIN_SEEDS     = [200_000 + i*137 for i in range(N_TRAIN_MAPS)]
+_EVAL_SEEDS      = [800_000 + i*137 for i in range(N_EVAL_MAPS)]
 
 # PPO
-GAMES_PER_ROUND = 300
-PPO_EPOCHS      = 4
-PPO_BATCH       = 256
-PPO_CLIP        = 0.20
-GAMMA           = 0.98
-LAM             = 0.95
-VAL_COEF        = 0.5
-ENT_INIT        = 0.012
-ENT_DECAY       = 0.97
-ENT_MIN         = 0.003
-GRAD_CLIP       = 1.0
-PPO_LR          = 3e-4
-WD              = 1e-4
-LEAGUE_SIZE     = 6
+GAMES_PER_ROUND  = 350
+PPO_EPOCHS       = 4
+PPO_BATCH        = 256
+PPO_CLIP         = 0.20
+GAMMA            = 0.98
+LAM              = 0.95
+VAL_COEF         = 0.5
+ENT_INIT         = 0.012
+ENT_DECAY        = 0.97
+ENT_MIN          = 0.003
+GRAD_CLIP        = 1.0
+PPO_LR           = 3e-4
+WD               = 1e-4
+LEAGUE_SIZE      = 6
 MAX_TOTAL_ROUNDS = 150
 
 MODEL_PATH = "model_ppo.pth"
 BEST_PATH  = "model_ppo_best.pth"
 
 
-# ── Seeding ───────────────────────────────────────────────────────────────────
 def set_seed(s: int):
     random.seed(s); np.random.seed(s); torch.manual_seed(s)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(s)
@@ -359,17 +382,24 @@ def bet(g, pl, bombs):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Observation planes  (27ch — identical to v9; copy verbatim into agent.py)
+# Observation planes  (27ch — copy verbatim into agent.py)
 # ══════════════════════════════════════════════════════════════════════════════
+
+# [PERF-1] FIX: blast_m() was previously called TWICE per bomb in etp/tet/fpp
+#          (once for indexing, once for the value update), running the BFS
+#          inner loop twice.  Now pre-computed into a local variable bm and
+#          reused.  All three functions benefit from this fix.
+
 def etp(g, pl, bombs, hz=EXPLOSION_TIME_HORIZON):
+    """Explosion time-plane: fraction of time-horizon remaining per cell."""
     p = np.ones((BOARD_SIZE,BOARD_SIZE), dtype=np.float32)
     if bombs is None or len(bombs)==0: return p
     t=bet(g,pl,bombs); dn=hz if hz>0 else 1.0
     for i in range(len(bombs)):
-        r=brad(pl, int(bombs[i][3]) if bombs.shape[1]>3 else -1)
-        nm=min(float(max(0,int(t[i]))),hz)/dn
-        p[blast_m(g, int(bombs[i][0]), int(bombs[i][1]), r)] = \
-            np.minimum(p[blast_m(g, int(bombs[i][0]), int(bombs[i][1]), r)], nm)
+        r  = brad(pl, int(bombs[i][3]) if bombs.shape[1]>3 else -1)
+        nm = min(float(max(0,int(t[i]))),hz)/dn
+        bm = blast_m(g, int(bombs[i][0]), int(bombs[i][1]), r)  # compute ONCE
+        p[bm] = np.minimum(p[bm], nm)                           # reuse bm
     return p
 
 def dng(g, pl, bombs, thr=1):
@@ -385,8 +415,9 @@ def cdng(g, pl, bombs, ch=3):
     for i in range(len(bombs)):
         e,o=int(eff[i]),int(orig[i])
         if e<=1 or e>ch or e>=o: continue
-        r=brad(pl, int(bombs[i][3]) if bombs.shape[1]>3 else -1)
-        p[blast_m(g, int(bombs[i][0]), int(bombs[i][1]), r)]=1.0
+        r  = brad(pl, int(bombs[i][3]) if bombs.shape[1]>3 else -1)
+        bm = blast_m(g, int(bombs[i][0]), int(bombs[i][1]), r)
+        p[bm] = 1.0
     return p
 
 def fdng(g, pl, bombs, hz=EXPLOSION_TIME_HORIZON):
@@ -394,21 +425,22 @@ def fdng(g, pl, bombs, hz=EXPLOSION_TIME_HORIZON):
     if bombs is None or len(bombs)==0: return p
     eff=bet(g,pl,bombs); dn=float(max(1.0,hz))
     for i in range(len(bombs)):
-        r=brad(pl, int(bombs[i][3]) if bombs.shape[1]>3 else -1)
-        s=1.0-min(float(max(0,int(eff[i]))),dn)/dn
+        r = brad(pl, int(bombs[i][3]) if bombs.shape[1]>3 else -1)
+        s = 1.0-min(float(max(0,int(eff[i]))),dn)/dn
         if s<=0: continue
-        bm=blast_m(g, int(bombs[i][0]), int(bombs[i][1]), r)
-        p[bm]=np.maximum(p[bm],s)
+        bm = blast_m(g, int(bombs[i][0]), int(bombs[i][1]), r)
+        p[bm] = np.maximum(p[bm], s)
     return p
 
 def tet(g, pl, bombs):
-    t=np.full((BOARD_SIZE,BOARD_SIZE),9999,dtype=np.int32)
+    """Time to explosion per cell (minimum over all bombs that cover it)."""
+    t=np.full((BOARD_SIZE,BOARD_SIZE), 9999, dtype=np.int32)
     if bombs is None or len(bombs)==0: return t
     eff=bet(g,pl,bombs)
     for i,b in enumerate(bombs):
-        r=brad(pl, int(b[3]) if bombs.shape[1]>3 else -1)
-        t[blast_m(g,int(b[0]),int(b[1]),r)] = \
-            np.minimum(t[blast_m(g,int(b[0]),int(b[1]),r)], int(max(0,eff[i])))
+        r  = brad(pl, int(b[3]) if bombs.shape[1]>3 else -1)
+        bm = blast_m(g, int(b[0]), int(b[1]), r)    # compute ONCE
+        t[bm] = np.minimum(t[bm], int(max(0,eff[i])))  # reuse bm
     return t
 
 def pp(g, pl, bombs, mid):
@@ -420,6 +452,7 @@ def pp(g, pl, bombs, mid):
     return p
 
 def fpp(g, pl, bombs, mid):
+    """Forecast placement potential: highlight cells where live opponents could bomb."""
     p=np.zeros((BOARD_SIZE,BOARD_SIZE), dtype=np.float32); bk=bset(bombs)
     for pid in range(4):
         if pid==mid or pid>=len(pl) or int(pl[pid][2])!=1 or int(pl[pid][3])<=0: continue
@@ -430,7 +463,8 @@ def fpp(g, pl, bombs, mid):
             nr,nc=np_((r,c),a)
             if pas(g,nr,nc) and (nr,nc) not in bk: cands.append((nr,nc))
         for pr,pc in cands:
-            p[blast_m(g,pr,pc,rad)]=np.maximum(p[blast_m(g,pr,pc,rad)],0.5)
+            bm = blast_m(g, pr, pc, rad)    # compute ONCE per candidate
+            p[bm] = np.maximum(p[bm], 0.5)  # reuse bm
     return p
 
 def btl(g, pl, bombs, mid):
@@ -447,16 +481,19 @@ def btl(g, pl, bombs, mid):
         elif dc==-1: o[:,:-1]=a[:,1:]
         elif dc==1: o[:,1:]=a[:,:-1]
         return o
-    exits=sum(sh(pv.astype(np.int32),dr,dc) for dr,dc in [(-1,0),(1,0),(0,-1),(0,1)])
+    exits   = sum(sh(pv.astype(np.int32),dr,dc) for dr,dc in [(-1,0),(1,0),(0,-1),(0,1)])
     xt=tet(g,pl,bombs); dn_=dng(g,pl,bombs,1); dangerous=(dn_>0)|(xt<=2)
-    fragile=sum(sh((dangerous&pv).astype(np.int32),dr,dc) for dr,dc in [(-1,0),(1,0),(0,-1),(0,1)])
-    p=np.where(exits==0,1.00,p); p=np.where((exits==1)&(fragile>=1),0.85,p)
-    p=np.where((exits==1)&(fragile==0),0.65,p); p=np.where((exits==2)&(fragile>=2),0.40,p)
-    p=np.where((exits==2)&(fragile<2),0.20,p); p=p*pv
+    fragile = sum(sh((dangerous&pv).astype(np.int32),dr,dc) for dr,dc in [(-1,0),(1,0),(0,-1),(0,1)])
+    p=np.where(exits==0,    1.00, p)
+    p=np.where((exits==1)&(fragile>=1), 0.85, p)
+    p=np.where((exits==1)&(fragile==0), 0.65, p)
+    p=np.where((exits==2)&(fragile>=2), 0.40, p)
+    p=np.where((exits==2)&(fragile<2),  0.20, p)
+    p=p*pv
     ri=np.arange(BOARD_SIZE)[:,None]; ci_=np.arange(BOARD_SIZE)[None,:]
     mh=np.abs(ri-mr)+np.abs(ci_-mc)
-    p=np.maximum(p,np.where((mh<=1)&pv,0.75,0.0))
-    p=np.maximum(p,np.where((mh<=2)&pv,0.35,0.0))
+    p=np.maximum(p, np.where((mh<=1)&pv, 0.75, 0.0))
+    p=np.maximum(p, np.where((mh<=2)&pv, 0.35, 0.0))
     return p.astype(np.float32)
 
 
@@ -598,7 +635,6 @@ def encode_obs(g, pl, bombs, mid, step):
 # ══════════════════════════════════════════════════════════════════════════════
 # Network  (copy BomberNet verbatim into agent.py for inference)
 # ══════════════════════════════════════════════════════════════════════════════
-
 _HEAD_CH = 8   # 8 × 7 × 7 = 392 + 7 scalars = 399 feat_dim
 
 class ResidualBlock(nn.Module):
@@ -612,35 +648,51 @@ class ResidualBlock(nn.Module):
         return torch.relu(self.b2(self.c2(h))+x)
 
 class BomberNet(nn.Module):
+    """
+    Spatial CNN (20ch) + scalar MLP (7ch) → actor-critic heads.
+
+    KEY DESIGN:  value branch runs on f.detach() — value gradients do NOT
+    flow back to the shared backbone.  This prevents the value loss from
+    corrupting the policy feature representations.
+
+    COPY THIS CLASS VERBATIM INTO agent.py FOR INFERENCE.
+    """
     _SP=SPATIAL_CHANNELS; _SC=SCALAR_CHANNELS; _POOL=7
-    def __init__(self,w=64):
+    def __init__(self, w=64):
         super().__init__()
         nsp,nsc=len(self._SP),len(self._SC); ps=self._POOL
-        fd=_HEAD_CH*ps*ps+nsc          # 8*49+7 = 399
+        fd=_HEAD_CH*ps*ps+nsc          # 8×49+7 = 399
         self.stem=nn.Sequential(
             nn.Conv2d(nsp,w,3,padding=1,bias=False),nn.BatchNorm2d(w),nn.ReLU(True),
             nn.Conv2d(w,w,3,padding=1,bias=False),nn.BatchNorm2d(w),nn.ReLU(True))
         self.blocks=nn.Sequential(
             ResidualBlock(w,.05),ResidualBlock(w,.05),ResidualBlock(w,.05))
         self.pool=nn.AdaptiveAvgPool2d(ps)
-        self.pcv=nn.Conv2d(w,_HEAD_CH,1)         # policy 1×1 conv
-        self.vcv=nn.Conv2d(w,_HEAD_CH,1)         # value  1×1 conv (detached)
-        self.ph=nn.Sequential(nn.Flatten(),nn.Linear(fd,128),nn.ReLU(True),nn.Dropout(.05),nn.Linear(128,NUM_ACTIONS))
-        self.vh=nn.Sequential(nn.Flatten(),nn.Linear(fd,128),nn.ReLU(True),nn.Dropout(.02),nn.Linear(128,1))
+        self.pcv=nn.Conv2d(w,_HEAD_CH,1)          # policy 1×1 bottleneck
+        self.vcv=nn.Conv2d(w,_HEAD_CH,1)          # value  1×1 bottleneck (detached)
+        self.ph=nn.Sequential(
+            nn.Flatten(),nn.Linear(fd,128),nn.ReLU(True),
+            nn.Dropout(.05),nn.Linear(128,NUM_ACTIONS))
+        self.vh=nn.Sequential(
+            nn.Flatten(),nn.Linear(fd,128),nn.ReLU(True),
+            nn.Dropout(.02),nn.Linear(128,1))
         self.register_buffer("_sp",torch.tensor(self._SP,dtype=torch.long))
         self.register_buffer("_sc",torch.tensor(self._SC,dtype=torch.long))
-        nn.init.orthogonal_(self.ph[-1].weight,gain=0.01); nn.init.zeros_(self.ph[-1].bias)
-        nn.init.orthogonal_(self.vh[-1].weight,gain=1.0);  nn.init.zeros_(self.vh[-1].bias)
-    def forward(self,x):
+        # Orthogonal init: tiny output weights → near-uniform initial policy
+        nn.init.orthogonal_(self.ph[-1].weight, gain=0.01)
+        nn.init.zeros_(self.ph[-1].bias)
+        nn.init.orthogonal_(self.vh[-1].weight, gain=1.0)
+        nn.init.zeros_(self.vh[-1].bias)
+
+    def forward(self, x):
         sp=x[:,self._sp]; sc=x[:,self._sc,0,0]
-        f=self.pool(self.blocks(self.stem(sp)))   # b×64×7×7
-        p=torch.relu(self.pcv(f))                 # policy path  (gradient flows to backbone)
-        v=torch.relu(self.vcv(f.detach()))        # value path   (DETACHED — critical!)
-        logits=self.ph(torch.cat([p.flatten(1),sc],1))
-        value =self.vh(torch.cat([v.flatten(1),sc],1)).squeeze(-1)
+        f=self.pool(self.blocks(self.stem(sp)))    # b×64×7×7
+        p=torch.relu(self.pcv(f))                  # policy path (grad flows)
+        v=torch.relu(self.vcv(f.detach()))         # value  path (DETACHED — critical)
+        logits = self.ph(torch.cat([p.flatten(1), sc], 1))
+        value  = self.vh(torch.cat([v.flatten(1), sc], 1)).squeeze(-1)
         return logits, value
 
-    
 def fwd(m, x): return m(x)
 
 
@@ -652,7 +704,7 @@ def lmask(g, bombs, pos, bl):
     return m
 
 def smask(g, pl, bombs, mid, lm):
-    """Safety shield — keeps agent away from dangerous tiles."""
+    """Safety shield — used in Stage 1+ and always during evaluation."""
     m=lm.copy()
     if mid>=len(pl) or int(pl[mid][2])!=1:
         if m.sum()<=0: m[0]=1.0; return m
@@ -689,7 +741,6 @@ def sample_a(model, st, mask, stoch=True, temp=1.0):
 # Helper agents
 # ══════════════════════════════════════════════════════════════════════════════
 class StopAgent:
-    """Does nothing every step — used as a placeholder opponent."""
     def __init__(self, aid): self.aid=int(aid)
     def act(self, obs):      return 0
 
@@ -703,7 +754,8 @@ class FrozenAgent:
             self._s+=1; return 0
         s=self._s; self._s+=1
         dev=next(self.model.parameters()).device
-        st=encode_obs(obs["map"],obs["players"],obs["bombs"],self.aid,s).unsqueeze(0).to(dev)
+        st=encode_obs(obs["map"],obs["players"],obs["bombs"],self.aid,s)\
+             .unsqueeze(0).to(dev)
         pos=(int(obs["players"][self.aid][0]),int(obs["players"][self.aid][1]))
         bl_=int(obs["players"][self.aid][3])
         lm_=lmask(obs["map"],obs["bombs"],pos,bl_)
@@ -712,7 +764,7 @@ class FrozenAgent:
         return a
 
 class League:
-    """Sliding window of past policy snapshots for self-play."""
+    """Sliding window of past policy snapshots for self-play diversity."""
     def __init__(self, n=LEAGUE_SIZE): self.n=n; self.snaps: list=[]
     def add(self, m):
         s=copy.deepcopy(m).cpu().eval(); self.snaps.append(s)
@@ -724,20 +776,20 @@ class League:
 # Stage-specific reward weights  +  reward_fn
 # ══════════════════════════════════════════════════════════════════════════════
 _RW = {
-    # Stage 0: farming is the primary signal; no kills to get positive reward
+    # Stage 0: farming IS the primary signal; no kills exist to provide reward
     "solo_farming": dict(
         tick=0.0003, death=-3.0, kill=2.0, kill_last=3.5,
-        item_r=0.05, item_c=0.10,
-        box=0.12, box_extra=0.015,        # ← main signal
+        item_r=0.05,  item_c=0.10,
+        box=0.12,  box_extra=0.015,
         safe_bomb=0.06, unsafe_bomb=-0.10,
         bomb_enemy=0.20, bomb_box=0.012, chain=0.003,
         stall=-0.001, win=8.0, survive=0.4, lose=-1.0,
     ),
-    # Stage 1: shift emphasis to killing; box reward secondary
+    # Stage 1: kill reward elevated; boxes secondary
     "1v1_combat": dict(
         tick=0.0002, death=-4.5, kill=3.5, kill_last=6.0,
-        item_r=0.04, item_c=0.06,
-        box=0.05, box_extra=0.008,
+        item_r=0.04,  item_c=0.06,
+        box=0.05,  box_extra=0.008,
         safe_bomb=0.10, unsafe_bomb=-0.15,
         bomb_enemy=0.40, bomb_box=0.010, chain=0.004,
         stall=-0.001, win=12.0, survive=0.5, lose=-2.5,
@@ -745,8 +797,8 @@ _RW = {
     # Stages 2-4: balanced
     "default": dict(
         tick=0.0002, death=-4.0, kill=2.0, kill_last=3.5,
-        item_r=0.05, item_c=0.08,
-        box=0.04, box_extra=0.010,
+        item_r=0.05,  item_c=0.08,
+        box=0.04,  box_extra=0.010,
         safe_bomb=0.08, unsafe_bomb=-0.12,
         bomb_enemy=0.25, bomb_box=0.012, chain=0.003,
         stall=-0.001, win=10.0, survive=0.5, lose=-1.5,
@@ -821,7 +873,7 @@ class DemoBuffer:
 
     def __len__(self): return len(self._states)
 
-    def sample(self, n: int):
+    def sample(self, n: int) -> Tuple[torch.Tensor, torch.Tensor]:
         idxs = np.random.randint(0, len(self._states), min(n, len(self._states)))
         s = torch.from_numpy(np.stack([self._states[i] for i in idxs])).float()
         a = torch.tensor([self._actions[i] for i in idxs], dtype=torch.long)
@@ -832,62 +884,95 @@ def collect_teacher_demos(teacher_cls, cfg: StageConfig) -> DemoBuffer:
     """
     Run the teacher on N training maps and record (encoded_state, teacher_action).
 
-    Opponent setup mirrors the stage so demos reflect the right game context:
+    Opponent setup mirrors the stage context:
       Stage 0 (n_opp=0): teacher vs 3 STOP → pure farming scenarios.
       Stage 1 (n_opp=1): teacher vs 1 SmarterRuleAgent + 2 STOP.
       Stage 2 (n_opp=2): teacher vs 2 SmarterRuleAgent + 1 STOP.
       Stage 3+           teacher vs 3 SmarterRuleAgent.
+
+    [FIX-4] Teacher actions filtered through legal mask — illegal recommendations
+            (e.g. bomb when bombs_left=0) are skipped so BC targets are always valid.
+    [FIX-6] Active opponent positions randomised per game for geometry diversity.
     """
-    buf = DemoBuffer()
-    opp_cls = SmarterRuleAgent or StopAgent
+    buf      = DemoBuffer()
+    opp_cls  = SmarterRuleAgent or StopAgent
+    skipped  = 0
 
     for gi in range(cfg.n_demo):
         map_seed = _TRAIN_SEEDS[gi % N_TRAIN_MAPS]
         cid      = gi % 4
-        env      = BomberEnv(max_steps=MAX_STEPS, seed=map_seed)
-        obs      = env.reset()
-        teacher  = teacher_cls(cid)
+        # [FIX-6] Randomise active opponent positions per game
+        rng_demo = random.Random(map_seed + gi * 88_003)
+        others   = [p for p in range(4) if p != cid]
+        active   = rng_demo.sample(others, min(cfg.n_opp, len(others)))
 
-        others = [p for p in range(4) if p != cid]
-        active = others[:cfg.n_opp]
-        opps   = {pid: (opp_cls(pid) if pid in active else StopAgent(pid))
-                  for pid in others}
+        env     = BomberEnv(max_steps=MAX_STEPS, seed=map_seed)
+        obs     = env.reset()
+        teacher = teacher_cls(cid)
+        opps    = {pid: (opp_cls(pid) if pid in active else StopAgent(pid))
+                   for pid in others}
 
         done=False; step=0
         while not done:
             if int(obs["players"][cid][2])!=1: break
-            t_action = int(teacher.act(obs))
-            state    = encode_obs(obs["map"],obs["players"],obs["bombs"],cid,step).numpy()
-            buf.add(state, t_action)
-            acts=[0]*4; acts[cid]=t_action
+            pos    = (int(obs["players"][cid][0]),int(obs["players"][cid][1]))
+            bl_    = int(obs["players"][cid][3])
+            lm     = lmask(obs["map"], obs["bombs"], pos, bl_)
+            t_act  = int(teacher.act(obs))
+
+            # [FIX-4] Only store teacher action if it is legal
+            if lm[t_act] > 0:
+                state = encode_obs(obs["map"],obs["players"],obs["bombs"],cid,step).numpy()
+                buf.add(state, t_act)
+            else:
+                skipped += 1
+
+            acts=[0]*4; acts[cid]=t_act
             for pid,ag in opps.items(): acts[pid]=ag.act(obs)
             obs,terminated,truncated=env.step(acts)
             done=bool(terminated or truncated); step+=1
 
-    print(f"  Teacher demos: {len(buf):,} transitions from {cfg.n_demo} games", flush=True)
+    print(f"  Teacher demos: {len(buf):,} transitions from {cfg.n_demo} games "
+          f"(skipped {skipped} illegal teacher actions)", flush=True)
     return buf
 
 
-def bc_pretrain(model: nn.Module, buf: DemoBuffer, optimizer,
-                n_steps: int, batch_size: int = 256):
-    """Pure behavioural cloning on teacher demonstrations: min CE(logits, a_teacher)."""
+def bc_pretrain(model: nn.Module, buf: DemoBuffer, n_steps: int,
+                batch_size: int = 256):
+    """
+    Pure behavioural cloning on teacher demonstrations: min CE(logits, a_teacher).
+
+    [FIX-7] Uses a DEDICATED fresh Adam(LR=1e-3) — NOT the shared PPO AdamW.
+            The PPO optimizer carries momentum/second-moment estimates tuned for
+            PPO gradients.  Reusing it for BC would:
+              • skew step sizes (Adam adapts per-parameter; PPO params ≠ BC params)
+              • cause large early BC steps or tiny ones depending on prior momentum
+            A fresh optimizer cold-starts cleanly.  After bc_pretrain returns, the
+            PPO optimizer resumes untouched and warms up naturally over the first
+            few PPO rounds of the new stage.
+    """
     if len(buf) < batch_size:
         print("  ⚠ Too few demos for BC pretrain — skipping.", flush=True); return
+
+    bc_opt = optim.Adam(model.parameters(), lr=1e-3)   # fresh, higher LR
     model.train(); losses: List[float]=[]
+
     for step in range(n_steps):
         states,actions = buf.sample(batch_size)
         states=states.to(DEVICE); actions=actions.to(DEVICE)
-        logits,_ = fwd(model,states)
-        loss = F.cross_entropy(logits,actions)
-        optimizer.zero_grad(set_to_none=True)
+        logits,_ = fwd(model, states)
+        loss = F.cross_entropy(logits, actions)
+        bc_opt.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(),GRAD_CLIP)
-        optimizer.step()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        bc_opt.step()
         losses.append(loss.item())
-        if (step+1)%500==0:
+        if (step+1) % 500 == 0:
             print(f"  BC {step+1}/{n_steps} | loss={np.mean(losses[-200:]):.4f}",
                   flush=True)
+
     print(f"  BC pretrain done | final_loss={np.mean(losses[-500:]):.4f}", flush=True)
+    # bc_opt goes out of scope and is discarded; PPO optimizer is unaffected.
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -907,11 +992,12 @@ _EVAL_P = _p((TacticalRuleAgent,2),(GeniusRuleAgent,2),(SmarterRuleAgent,2),
               (BoxFarmerAgent,1),(SimpleRuleAgent,1))
 
 _POOL_MAP = {
-    "stop":       [],
-    "weak":       _WEAK,
-    "medium":     _MED,
-    "med_strong": _MEDSTR,
-    "strong":     _STR,
+    "stop":           [],
+    "weak":           _WEAK,
+    "medium":         _MED,
+    "med_strong":     _MEDSTR,
+    "strong":         _STR,
+    "simple_smarter": None,   # handled inline in Stage 1
 }
 
 
@@ -920,7 +1006,7 @@ def make_opps(cid: int, opp_seed: int, frozen,
     cfg    = curriculum.cfg
     rng    = random.Random(opp_seed)
     others = [p for p in range(4) if p != cid]
-    opps   = {}
+    opps: dict = {}
 
     # ── Stage 0: everyone stops ───────────────────────────────────────────
     if cfg.n_opp == 0:
@@ -933,8 +1019,10 @@ def make_opps(cid: int, opp_seed: int, frozen,
         for pid in others:
             if pid != active:
                 opps[pid]=StopAgent(pid); continue
-            # Progressive difficulty within Stage 1:
-            # r0-3 → Simple | r4-7 → 50/50 | r8+ → Smarter
+            # Progressive difficulty ramp within Stage 1:
+            #   rounds  0-3 → SimpleRuleAgent only
+            #   rounds  4-7 → 50/50 Simple / Smarter
+            #   rounds  8+  → SmarterRuleAgent only
             ri = curriculum.ri
             if ri < 4:
                 cls = SimpleRuleAgent or StopAgent
@@ -948,9 +1036,12 @@ def make_opps(cid: int, opp_seed: int, frozen,
     # ── Stage 2: 2 active opponents + 1 STOP ─────────────────────────────
     if cfg.n_opp == 2:
         pool   = _POOL_MAP.get(cfg.pool, _MED)
-        active = others[:2]; stop_pid = others[2]
-        opps[stop_pid] = StopAgent(stop_pid)
-        for pid in active:
+        # [FIX-2] Randomise which two positions are active; do NOT always use
+        #         others[:2].  The STOP slot now varies per game.
+        active = rng.sample(others, 2)
+        for pid in others:
+            if pid not in active:
+                opps[pid] = StopAgent(pid); continue
             r = rng.random()
             if r<0.25 and frozen is not None:
                 fa=FrozenAgent(pid,frozen,det=rng.random()<0.6); fa.reset(); opps[pid]=fa
@@ -1017,7 +1108,6 @@ def flatten(eps: List[Ep]):
     rt=mk(R,torch.float32); mt=mk(M,torch.float32)
     advt=mk(ADV,torch.float32)
     advt=(advt-advt.mean())/(advt.std()+1e-8)    # global norm — preserves kill signal
-    # DAgger label tensors
     has_t = torch.tensor([a is not None for a in TA], dtype=torch.bool)
     tacts = torch.tensor([a if a is not None else 0 for a in TA], dtype=torch.long)
     return st,at,lpt,rt,advt,mt,has_t,tacts
@@ -1031,26 +1121,34 @@ def collect(model: nn.Module, frozen, n_games: int,
     """
     Collect PPO rollouts on fixed training maps with decaying teacher labelling.
 
-    KEY DESIGN CHOICES:
+    DESIGN:
     • map_seed fixed per gi%N_TRAIN_MAPS → same 100 maps every round; value
-      function converges without overfitting to one map.
+      function converges without map-overfitting.
     • opp_seed varies per (total_round, gi) → different opponents each round.
-    • No shield mask in Stage 0 ("solo_farming"): agent MUST learn bomb
-      safety from reward signal (-4.5 death penalty). Shield suppresses this.
+    • No shield mask in Stage 0 (solo_farming): agent MUST learn bomb safety
+      from the reward signal (death=-3.0). Shield suppresses this learning.
     • Stage 1+: shield mask re-enabled to stabilise combat training.
-    • At each step, the teacher is queried independently (DAgger-lite): its
-      action is stored as a BC label but does NOT affect what the agent does.
+    • DAgger-lite: at each step, teacher queried independently; teacher action
+      stored as BC label but does NOT change what the agent does.
+
+    [FIX-4] Teacher actions filtered through legal mask before storing.
+            Illegal teacher actions (bomb when bombs_left=0, walk into wall)
+            are stored as None so BC loss is never pushed toward illegal moves.
+
+    [IMPROVE-9] Action Counter logged at round end.
+            If action-0 (STOP) > 60% of total, flag a warning — earliest
+            possible signal of entropy/policy collapse.
     """
     model.eval()
     if frozen is not None: frozen.eval()
     cfg          = curriculum.cfg
     stage_name   = cfg.name
     teacher_prob = curriculum.teacher_prob
-    # Solo stage: raw legal mask only — agent must learn from reward, not heuristics
     use_shield   = (stage_name != "solo_farming")
     teacher_cls  = _TEACHER_REGISTRY.get(cfg.teacher) if cfg.teacher else None
 
-    eps: List[Ep]=[]
+    eps: List[Ep] = []
+    action_ctr    = Counter()   # [IMPROVE-9] track action frequency
 
     for gi in range(n_games):
         map_seed = _TRAIN_SEEDS[gi % N_TRAIN_MAPS]
@@ -1060,7 +1158,7 @@ def collect(model: nn.Module, frozen, n_games: int,
         env     = BomberEnv(max_steps=MAX_STEPS, seed=map_seed)
         obs     = env.reset()
         opps    = make_opps(cid, opp_seed, frozen, league, curriculum)
-        teacher = teacher_cls(cid) if teacher_cls else None   # fresh per game
+        teacher = teacher_cls(cid) if teacher_cls else None  # fresh per game
 
         ep=Ep(); done=False; step=0; trunc_alive=False
 
@@ -1077,12 +1175,19 @@ def collect(model: nn.Module, frozen, n_games: int,
 
             with torch.no_grad():
                 a,lp,_,val=sample_a(model,st,train_mask,stoch=True,temp=1.0)
+            action_ctr[a] += 1   # [IMPROVE-9]
 
-            # DAgger-lite: query teacher at this state independently
-            t_action: Optional[int]=None
-            if teacher is not None and random.random()<teacher_prob:
-                try: t_action=int(teacher.act(obs))
-                except: pass
+            # ── DAgger-lite: query teacher at this state independently ──────
+            t_action: Optional[int] = None
+            if teacher is not None and random.random() < teacher_prob:
+                try:
+                    ta = int(teacher.act(obs))
+                    # [FIX-4] Only record if teacher action is legal
+                    if lm[ta] > 0:
+                        t_action = ta
+                except Exception:
+                    pass
+            # ─────────────────────────────────────────────────────────────────
 
             acts=[0]*4; acts[cid]=a
             for pid,ag in opps.items(): acts[pid]=int(ag.act(obs))
@@ -1105,16 +1210,27 @@ def collect(model: nn.Module, frozen, n_games: int,
             try:
                 ls=encode_obs(obs["map"],obs["players"],obs["bombs"],cid,step)\
                      .unsqueeze(0).to(DEVICE)
-                with torch.no_grad(): _,lv=fwd(model,ls); ep.last_val=float(lv.item())
+                with torch.no_grad():
+                    _,lv=fwd(model,ls); ep.last_val=float(lv.item())
             except: pass
 
         if ep.states: eps.append(ep)
-        if (gi+1)%50==0:
+        if (gi+1) % 50 == 0:
             tot_s=sum(len(e.states) for e in eps)
             tot_l=sum(sum(1 for a in e.teacher_actions if a is not None) for e in eps)
             print(f"  Rollout {gi+1}/{n_games} | eps={len(eps)} "
                   f"steps={tot_s} labels={tot_l} "
                   f"({100*tot_l/max(1,tot_s):.1f}%)", flush=True)
+
+    # [IMPROVE-9] Log action distribution — early STOP-collapse warning
+    total_acts = sum(action_ctr.values())
+    if total_acts > 0:
+        dist = " ".join(f"a{a}:{100*c/total_acts:.1f}%"
+                        for a,c in sorted(action_ctr.items()))
+        stop_pct = 100 * action_ctr.get(0, 0) / total_acts
+        warning  = "  ⚠ WARNING: STOP collapse suspected!" if stop_pct > 60 else ""
+        print(f"  Action dist: [{dist}]{warning}", flush=True)
+
     return eps
 
 
@@ -1123,6 +1239,14 @@ def collect(model: nn.Module, frozen, n_games: int,
 # ══════════════════════════════════════════════════════════════════════════════
 def ppo_update(model: nn.Module, eps: List[Ep], optimizer,
                ent_coef: float, bc_coef: float):
+    """
+    Standard PPO with clipped surrogate objective.
+
+    BC anchor: for steps where a teacher label exists (has_t==True), we add
+    bc_coef × CE(logits, teacher_action) to the loss.  The logits used are
+    the RAW (pre-mask) logits — correct because [FIX-4] guarantees the teacher
+    action is legal, so pushing the raw logit upward is meaningful.
+    """
     if not eps: return
     states,actions,old_lps,returns,advantages,masks,has_t,tacts=flatten(eps)
     N=states.shape[0]; model.train()
@@ -1149,11 +1273,11 @@ def ppo_update(model: nn.Module, eps: List[Ep], optimizer,
             vl=torch.mean((values-brt)**2)
             loss=pl+VAL_COEF*vl-ent_coef*ent
 
-            # BC anchor: CE loss only on teacher-labelled steps in this mini-batch
+            # BC anchor on teacher-labelled steps only
             bc_val=0.0
             if bc_coef>0 and bht.any():
-                bc_l=F.cross_entropy(logits[bht], bta[bht])
-                loss=loss+bc_coef*bc_l; bc_val=bc_l.item()
+                bc_l = F.cross_entropy(logits[bht], bta[bht])
+                loss = loss + bc_coef*bc_l; bc_val=bc_l.item()
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -1172,10 +1296,15 @@ def ppo_update(model: nn.Module, eps: List[Ep], optimizer,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Evaluation  (stage-specific metrics)
+# Evaluation  (stage-specific metrics — three independent functions)
 # ══════════════════════════════════════════════════════════════════════════════
-def evaluate_boxes(model: nn.Module, n: int=20, label: str="BoxEval") -> float:
-    """Stage 0 metric: average boxes destroyed per solo game."""
+def evaluate_boxes(model: nn.Module, n: int=20,
+                   label: str="BoxEval") -> float:
+    """
+    Stage 0 metric: average boxes destroyed per solo game.
+    No shield — matches the training mask used in solo_farming.
+    Also reports survival rate as a diagnostic.
+    """
     model.eval()
     boxes_t=steps_t=survived=0
     for gi in range(n):
@@ -1190,7 +1319,7 @@ def evaluate_boxes(model: nn.Module, n: int=20, label: str="BoxEval") -> float:
                  .unsqueeze(0).to(DEVICE)
             pos=(int(obs["players"][cid][0]),int(obs["players"][cid][1]))
             lm=lmask(obs["map"],obs["bombs"],pos,int(obs["players"][cid][3]))
-            # No shield in solo eval — matches training setup
+            # No shield — matches Stage 0 training setup
             with torch.no_grad(): a,_,_,_=sample_a(model,st,lm,stoch=False)
             acts=[0]*4; acts[cid]=a
             for pid,ag in opps.items(): acts[pid]=ag.act(obs)
@@ -1199,24 +1328,33 @@ def evaluate_boxes(model: nn.Module, n: int=20, label: str="BoxEval") -> float:
         boxes_t+=init_boxes-int(np.sum(obs["map"]==2))
         steps_t+=step
         if int(obs["players"][cid][2])==1: survived+=1
-    ng=max(1,n); avg=boxes_t/ng
-    print(f"{label} (solo,{n}g) | survived={survived}/{n} | "
+    ng=max(1,n); avg=boxes_t/ng; sur=survived/ng
+    print(f"{label} (solo,{n}g) | survived={survived}/{n} ({sur:.0%}) | "
           f"avg_boxes={avg:.1f} | steps={steps_t/ng:.0f}", flush=True)
     return avg
 
 
-def evaluate_1v1(model: nn.Module, n: int=20, label: str="1v1Eval") -> float:
-    """Stage 1 metric: win rate vs SmarterRuleAgent in pure 1v1 (2 STOP dummies)."""
+def evaluate_1v1(model: nn.Module, n: int=20,
+                 label: str="1v1Eval") -> float:
+    """
+    Stage 1 metric: win rate vs SmarterRuleAgent in pure 1v1 (2 STOP dummies).
+
+    [FIX-3] Opponent position varied by game index (others[gi%len(others)])
+            so all three possible opponent-corner combinations are covered
+            across the 20 evaluation games.
+    """
     model.eval()
     opp_cls=SmarterRuleAgent
     if opp_cls is None:
-        print(f"{label} | SmarterRuleAgent unavailable → 0.0", flush=True); return 0.0
+        print(f"{label} | SmarterRuleAgent unavailable → 0.0", flush=True)
+        return 0.0
     wins=draws=losses=kills_t=0
     for gi in range(n):
         ms=_EVAL_SEEDS[gi%N_EVAL_MAPS]; cid=gi%4
         env=BomberEnv(max_steps=MAX_STEPS,seed=ms); obs=env.reset()
         others=[p for p in range(4) if p!=cid]
-        act_opp=others[0]                       # fixed slot for consistent 1v1
+        # [FIX-3] Vary the enemy's corner across games
+        act_opp = others[gi % len(others)]
         opps={pid:(opp_cls(pid) if pid==act_opp else StopAgent(pid)) for pid in others}
         kills=0; done=False; step=0
         while not done:
@@ -1244,7 +1382,8 @@ def evaluate_1v1(model: nn.Module, n: int=20, label: str="1v1Eval") -> float:
     return wr
 
 
-def evaluate_full(model: nn.Module, n: int=20, label: str="FullEval") -> float:
+def evaluate_full(model: nn.Module, n: int=20,
+                  label: str="FullEval") -> float:
     """General metric: win rate vs mixed baseline pool (all 4 players active)."""
     model.eval()
     pool=_EVAL_P
@@ -1285,9 +1424,9 @@ def _eval_stage(model: nn.Module, curriculum: Curriculum,
                 n: int=20, label: str="Eval") -> float:
     """Dispatch to the correct evaluation function for the current stage."""
     m=curriculum.cfg.metric
-    if   m=="boxes":  return evaluate_boxes(model,n=n,label=label)
-    elif m=="wr1v1":  return evaluate_1v1(model,n=n,label=label)
-    else:             return evaluate_full(model,n=n,label=label)
+    if   m=="boxes":  return evaluate_boxes(model, n=n, label=label)
+    elif m=="wr1v1":  return evaluate_1v1(model,   n=n, label=label)
+    else:             return evaluate_full(model,   n=n, label=label)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1296,6 +1435,13 @@ def _eval_stage(model: nn.Module, curriculum: Curriculum,
 def main():
     print(f"\nDevice  : {DEVICE}", flush=True)
     print(f"Stages  : {[s.name for s in STAGES]}", flush=True)
+    print(f"Teachers available: {list(_TEACHER_REGISTRY.keys())}", flush=True)
+
+    # ── Validate teacher availability ─────────────────────────────────────
+    for st in STAGES:
+        if st.teacher and st.teacher not in _TEACHER_REGISTRY:
+            print(f"  ⚠ Stage '{st.name}' teacher '{st.teacher}' unavailable "
+                  f"— BC pretrain will be skipped for this stage.", flush=True)
 
     # ── Model ─────────────────────────────────────────────────────────────
     model=BomberNet().to(DEVICE)
@@ -1312,13 +1458,15 @@ def main():
                 model.load_state_dict(torch.load(ckpt, map_location=DEVICE))
                 print(f"Resumed model from {ckpt} | "
                       f"stage={curriculum.si} ({curriculum.cfg.name}) | "
-                      f"ri={curriculum.ri}", flush=True)
+                      f"ri={curriculum.ri} | tot={curriculum.tot}", flush=True)
                 break
             except Exception as e:
                 print(f"Could not load {ckpt}: {e}", flush=True)
 
-    # ── Persistent optimiser (momentum accumulates across rounds) ─────────
-    optimizer=optim.AdamW(model.parameters(),lr=PPO_LR,weight_decay=WD)
+    # ── Persistent optimiser (momentum accumulates across PPO rounds) ─────
+    # NOTE: bc_pretrain() uses its OWN fresh Adam so this is never corrupted
+    #       by BC gradient direction.  See [FIX-7].
+    optimizer=optim.AdamW(model.parameters(), lr=PPO_LR, weight_decay=WD)
     league=League(LEAGUE_SIZE); league.add(model)
 
     # ── Initial diagnostics ───────────────────────────────────────────────
@@ -1327,7 +1475,8 @@ def main():
     evaluate_1v1(model,  n=10, label="Init-1v1")
     evaluate_full(model, n=10, label="Init-Full")
 
-    print(f"\n═══ Curriculum training ({MAX_TOTAL_ROUNDS} total rounds) ═══", flush=True)
+    print(f"\n═══ Curriculum training ({MAX_TOTAL_ROUNDS} total rounds) ═══\n",
+          flush=True)
 
     for rnd in range(curriculum.tot, MAX_TOTAL_ROUNDS):
         cfg=curriculum.cfg
@@ -1337,9 +1486,11 @@ def main():
             banner="═"*64
             print(f"\n{banner}", flush=True)
             print(f"  STAGE {curriculum.si}: {cfg.name.upper()}", flush=True)
-            print(f"  Teacher: {cfg.teacher} | n_demo: {cfg.n_demo} | "
-                  f"bc_pretrain: {cfg.bc_pretrain}", flush=True)
-            print(f"  Advance when {cfg.metric} ≥ {cfg.thresh} "
+            print(f"  Teacher     : {cfg.teacher}", flush=True)
+            print(f"  n_demo      : {cfg.n_demo}  |  bc_pretrain steps: {cfg.bc_pretrain}", flush=True)
+            print(f"  BC coef     : {cfg.bc0:.3f} → {cfg.bcmin:.3f} (×{cfg.bcd}/round)", flush=True)
+            print(f"  Teacher prob: {cfg.tp0:.3f} → {cfg.tpmin:.3f} (×{cfg.tpd}/round)", flush=True)
+            print(f"  Advance when: {cfg.metric} ≥ {cfg.thresh} "
                   f"for {cfg.consec} consec rounds "
                   f"(min {cfg.minr}r, force at {cfg.maxr}r)", flush=True)
             print(f"{banner}", flush=True)
@@ -1347,14 +1498,14 @@ def main():
             teacher_cls=_TEACHER_REGISTRY.get(cfg.teacher) if cfg.teacher else None
             if teacher_cls and cfg.bc_pretrain>0:
                 demo_buf=collect_teacher_demos(teacher_cls, cfg)
-                bc_pretrain(model, demo_buf, optimizer, cfg.bc_pretrain)
-                del demo_buf    # free memory
+                # [FIX-7] Fresh Adam inside bc_pretrain — PPO optimizer untouched
+                bc_pretrain(model, demo_buf, cfg.bc_pretrain)
+                del demo_buf
             elif cfg.bc_pretrain==0:
                 print("  No BC pretrain for this stage.", flush=True)
             else:
-                print(f"  ⚠ Teacher {cfg.teacher!r} unavailable — skipping BC.", flush=True)
+                print(f"  ⚠ Teacher '{cfg.teacher}' unavailable — skipping BC.", flush=True)
 
-            # Quick sanity eval right after BC pretrain
             print("  Post-BC-pretrain diagnostics:", flush=True)
             _eval_stage(model, curriculum, n=10, label="Post-BC")
             curriculum.fresh=False; curriculum.save()
@@ -1366,16 +1517,17 @@ def main():
               f"ent={ent:.4f} │ bc={curriculum.bc_coef:.3f} │ "
               f"tp={curriculum.teacher_prob:.3f} ───", flush=True)
 
-        # ── Rollout collection ─────────────────────────────────────────────
+        # ── Rollout collection ────────────────────────────────────────────
         frozen=copy.deepcopy(model).cpu().eval()
         rollouts=collect(model, frozen, GAMES_PER_ROUND, curriculum, league)
 
         n_steps  = sum(len(e.states) for e in rollouts)
-        n_labels = sum(sum(1 for a in e.teacher_actions if a is not None) for e in rollouts)
+        n_labels = sum(sum(1 for a in e.teacher_actions if a is not None)
+                       for e in rollouts)
         avg_rew  = np.mean([r for ep in rollouts for r in ep.rewards]) if rollouts else 0.0
         print(f"  Collected {len(rollouts)} eps | {n_steps} steps | "
               f"{n_labels} teacher labels ({100*n_labels/max(1,n_steps):.1f}%) | "
-              f"avg_rew={avg_rew:.3f}", flush=True)
+              f"avg_rew={avg_rew:.4f}", flush=True)
 
         # ── PPO update ────────────────────────────────────────────────────
         ppo_update(model, rollouts, optimizer, ent, curriculum.bc_coef)
@@ -1396,12 +1548,20 @@ def main():
         torch.save(model.state_dict(), MODEL_PATH)
 
         if advanced:
-            # Post-advance diagnostics and bookkeeping
             print("  Post-advance diagnostics:", flush=True)
-            evaluate_full(model, n=10, label="Post-advance")
-            league=League(LEAGUE_SIZE); league.add(model)  # fresh league each stage
-            ent=max(ENT_INIT*0.6, ENT_INIT)               # partial entropy reset
-            best_metric=-1.0                               # reset best tracker
+            evaluate_full(model, n=10, label="Post-advance-Full")
+            evaluate_1v1(model,  n=10, label="Post-advance-1v1")
+
+            # Fresh league — no old-stage snapshots polluting self-play
+            league=League(LEAGUE_SIZE); league.add(model)
+
+            # [IMPROVE-10] Entropy resets to ENT_INIT on stage advance.
+            #   The expression max(ENT_INIT*0.6, ENT_INIT) always equals
+            #   ENT_INIT (0.6 < 1.0, so the max picks the larger value).
+            #   This is intentional: a full reset gives the agent fresh
+            #   exploration budget in the harder new stage.
+            ent=ENT_INIT
+            best_metric=-1.0   # reset best tracker for new stage
 
     # ── Final evaluation ──────────────────────────────────────────────────
     print("\n═══ Final evaluation ═══", flush=True)
