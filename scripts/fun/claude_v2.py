@@ -136,7 +136,7 @@ USE_RANKING_LOSS          = True   # Fix 2: pairwise Bradley-Terry loss instead 
 RANKING_MARGIN            = 0.05   # minimum return difference to count as a preference
 
 # Fixed map seeds: training / eval split
-N_TRAIN_MAPS     = 200
+N_TRAIN_MAPS     = 300
 N_EVAL_MAPS      = 50
 _TRAIN_SEEDS     = [300_000 + i*137 for i in range(N_TRAIN_MAPS)]
 _EVAL_SEEDS      = [900_000 + i*137 for i in range(N_EVAL_MAPS)]
@@ -860,11 +860,11 @@ def _print_deployment_note():
 
 def main():
     parser = argparse.ArgumentParser(description="Train ScorerNetV2 for hybrid Bomberland agent")
-    parser.add_argument("--n-games",       type=int,  default= N_GAMES,
+    parser.add_argument("--n-games",       type=int,  default= 10000,
                         help="self-play games to collect")
     parser.add_argument("--epochs",        type=int,  default=TRAIN_EPOCHS,
                         help="training epochs")
-    parser.add_argument("--rounds",        type=int,  default=1,
+    parser.add_argument("--rounds",        type=int,  default=3,
                         help="iterative refinement rounds (1 = single pass)")
     parser.add_argument("--skip-collect",  action="store_true",
                         help="skip data collection, load existing dataset")
@@ -892,10 +892,10 @@ def main():
 
     # ── eval only ─────────────────────────────────────────────────────────
     if args.eval_only:
-        if not os.path.exists(SCORER_PATH):
-            print(f"ERROR: {SCORER_PATH} not found."); return
+        if not os.path.exists(BEST_PATH):
+            print(f"ERROR: {BEST_PATH} not found."); return
         scorer = ScorerNetV2(in_dim=TOTAL_IN_DIM_V2).to(DEVICE)
-        scorer.load_state_dict(torch.load(SCORER_PATH, map_location=DEVICE))
+        scorer.load_state_dict(torch.load(BEST_PATH, map_location=DEVICE), strict=True)
         scorer.eval()
         evaluate(scorer, n_games=args.n_eval)
         return
