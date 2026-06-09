@@ -67,7 +67,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
-from agent.simple_rule_agent import SimpleRuleAgent
+from scripts.training.bomberv2 import SimpleRuleAgent
 
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.getcwd())
