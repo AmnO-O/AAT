@@ -132,7 +132,7 @@ class StageConfig:
 STAGES: List[StageConfig] = [
     # ── Stage 0: Solo Farming ──────────────────────────────────────────────
     StageConfig(
-        name="solo_farming", n_opp=0, teacher="BoxFarmerAgent",
+        name="solo_farming", n_opp=0, teacher="SamnuAgent",
         n_demo=200,  bc_pretrain=5000,
         bc0=0.30, bcmin=0.05, bcd=0.85,
         tp0=0.50, tpmin=0.10, tpd=0.88,
