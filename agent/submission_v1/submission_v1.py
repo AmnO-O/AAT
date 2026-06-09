@@ -80,28 +80,28 @@ STATE_DIM     = 27
 CAND_DIM      = 7
 TOTAL_IN_DIM  = STATE_DIM + CAND_DIM   # 34
 
+CAND_DIM_V2   = CAND_DIM + 3   # 7 + 3 = 10 new features
+TOTAL_IN_DIM_V2 = STATE_DIM + CAND_DIM_V2  # 27 + 10 = 37
 
 # =============================================================================
 # Neural scorer definition  (must match train_scorer.py exactly)
 # =============================================================================
 
-class ScorerNet(nn.Module if _TORCH else object):
+class ScorerNetV2(nn.Module):
     """
-    Tiny MLP: 34 → 64 → 32 → 1.
-    Scores a single (state_context, candidate_features) pair.
-    ~46K parameters.
+    37 → 64 → 32 → 1.
+    Same depth as v1 ScorerNet but wider input to accommodate 3 new candidate
+    features.  Copy this class into submission_v1.py when deploying.
     """
-    def __init__(self):
-        if not _TORCH:
-            return
+    def __init__(self, in_dim: int = TOTAL_IN_DIM_V2):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(TOTAL_IN_DIM, 64), nn.ReLU(),
-            nn.Linear(64, 32),           nn.ReLU(),
-            nn.Linear(32, 1)
+            nn.Linear(in_dim, 64), nn.ReLU(),
+            nn.Linear(64, 32),     nn.ReLU(),
+            nn.Linear(32, 1),
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x).squeeze(-1)
 
 
@@ -112,7 +112,7 @@ def _load_scorer():
     if not os.path.exists(SCORER_PATH):
         return None
     try:
-        model = ScorerNet()
+        model = ScorerNetV2()
         model.load_state_dict(torch.load(SCORER_PATH, map_location="cpu"))
         model.eval()
         return model
@@ -905,35 +905,87 @@ def _encode_candidate_features(action, my_r, my_c, my_radius,
 # Neural candidate scorer
 # =============================================================================
 
-def _score_candidates_with_net(net, state_ctx, candidates,
-                                my_r, my_c, my_radius,
-                                grid, players, agent_id,
-                                danger_any, bomb_pos, danger_by_time,
-                                obs_bombs):
+def _encode_candidate_features_v2(action, my_r, my_c, my_radius,
+                                   grid, players, agent_id,
+                                   danger_any, bomb_pos, danger_by_time,
+                                   obs_bombs):
     """
-    Score each candidate action with the neural net.
-    Returns action with highest score, or None on failure.
+    10 floats = original 7 (from submission_v1) + 3 new action-specific features.
+
+    New features (indices 7-9):
+      f8  boxes_from_dest: boxes in blast radius of a default bomb placed at
+          destination. Zero for STOP. For movement, this previews 'if I move
+          here and then bomb, how much board control do I gain?'
+
+      f9  escape_exits_from_dest: number of walkable non-danger neighbours from
+          destination (proxy for how trapped the agent becomes after this move).
+          Normalised by 4.
+
+      f10 enemy_dist_from_dest: normalised BFS distance to nearest live enemy
+          from destination. Closer = higher combat relevance.
     """
-    if not _TORCH or net is None or not candidates:
-        return None
-    try:
-        state_t = torch.tensor(state_ctx, dtype=torch.float32)
-        scores  = []
-        for a in candidates:
-            cand_f = _encode_candidate_features(
-                a, my_r, my_c, my_radius,
-                grid, players, agent_id,
-                danger_any, bomb_pos, danger_by_time,
-                obs_bombs
-            )
-            inp = torch.cat([state_t, torch.tensor(cand_f, dtype=torch.float32)])
-            with torch.no_grad():
-                s = float(net(inp.unsqueeze(0)).item())
-            scores.append(s)
-        best_idx = int(np.argmax(scores))
-        return candidates[best_idx]
-    except Exception:
-        return None
+    # Base 7 features from v1
+    base = list(_encode_candidate_features(
+        action, my_r, my_c, my_radius,
+        grid, players, agent_id,
+        danger_any, bomb_pos, danger_by_time,
+        obs_bombs
+    ))
+    # Drop the trailing 0.0 padding (last element of base is always 0.0 spare)
+    # and extend with 3 new features.
+
+    h, w = grid.shape
+
+    # Destination position
+    if action == STOP or action == PLACE_BOMB:
+        nr, nc = my_r, my_c
+    else:
+        dr, dc = MOVES[action]
+        nr, nc = my_r + dr, my_c + dc
+
+    # f8: boxes in blast radius from destination (using agent's current radius)
+    if action == PLACE_BOMB:
+        # Already captured in bval_n (feature 4); use 0 to avoid double-encoding
+        boxes_from_dest = 0.0
+    else:
+        dest_blast = _blast_tiles(nr, nc, my_radius, grid)
+        boxes_from_dest = min(
+            sum(1 for r, c in dest_blast if grid[r, c] == BOX), 8
+        ) / 8.0
+
+    # f9: open non-danger neighbours at destination (escape richness)
+    open_safe_at_dest = sum(
+        1 for dr2, dc2 in ((-1, 0), (1, 0), (0, -1), (0, 1))
+        if _walkable(nr + dr2, nc + dc2, grid, bomb_pos)
+        and (nr + dr2, nc + dc2) not in danger_any
+    ) / 4.0
+
+    # f10: BFS distance to nearest enemy from destination (normalised)
+    live_enemies = {
+        (int(players[i][0]), int(players[i][1]))
+        for i in range(len(players))
+        if i != agent_id and int(players[i][2]) == 1
+    }
+    if not live_enemies:
+        enemy_dist_dest = 1.0
+    else:
+        vis = {(nr, nc)}
+        q   = deque([((nr, nc), 0)])
+        enemy_dist_dest = 1.0
+        while q:
+            pos2, d = q.popleft()
+            if pos2 in live_enemies:
+                enemy_dist_dest = d / 16.0
+                break
+            if d >= 16:
+                continue
+            for dr3, dc3 in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                np2 = (pos2[0] + dr3, pos2[1] + dc3)
+                if np2 not in vis and _walkable(np2[0], np2[1], grid, bomb_pos):
+                    vis.add(np2)
+                    q.append((np2, d + 1))
+
+    return base + [boxes_from_dest, open_safe_at_dest, enemy_dist_dest]
 
 
 # =============================================================================
@@ -1108,7 +1160,7 @@ class Agent:
                     state_ctx[20] = float(is_stuck)  # fill is_stuck slot
                     state_ctx[21] = float(combat_mode)
 
-                    net_action = _score_candidates_with_net(
+                    net_action = _encode_candidate_features_v2(
                         self._scorer, state_ctx, cands,
                         my_r,my_c,my_radius,
                         grid,players,self.agent_id,
