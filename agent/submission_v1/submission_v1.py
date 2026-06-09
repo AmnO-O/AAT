@@ -81,17 +81,17 @@ CAND_DIM      = 7
 TOTAL_IN_DIM  = STATE_DIM + CAND_DIM   # 34
 
 # v2: extended candidate feature dimension
-CAND_DIM_V2   = CAND_DIM + 3   # 7 + 3 = 10 new features
-TOTAL_IN_DIM_V2 = STATE_DIM + CAND_DIM_V2  # 27 + 10 = 37
+CAND_DIM_V2   = CAND_DIM + 4   # 7 + 4 = 11 new features
+TOTAL_IN_DIM_V2 = STATE_DIM + CAND_DIM_V2  # 27 + 11 = 38
 
 # =============================================================================
 # Neural scorer definition  (must match train_scorer.py exactly)
 # =============================================================================
 class ScorerNetV2(nn.Module):
     """
-    37 → 64 → 32 → 1.
-    Same depth as v1 ScorerNet but wider input to accommodate 3 new candidate
-    features.  Copy this class into submission_v1.py when deploying.
+    38 → 64 → 32 → 1.
+    Same depth as v1 ScorerNet but wider input to accommodate 4 new candidate
+    features (f8 boxes_from_dest, f9 escape_exits, f10 enemy_dist, f11 hyp_danger).
     """
     def __init__(self, in_dim: int = TOTAL_IN_DIM_V2):
         super().__init__()
@@ -114,19 +114,21 @@ def _encode_candidate_features_v2(action, my_r, my_c, my_radius,
                                    danger_any, bomb_pos, danger_by_time,
                                    obs_bombs):
     """
-    10 floats = original 7 (from submission_v1) + 3 new action-specific features.
+    11 floats = original 7 (from submission_v1) + 4 new action-specific features.
 
-    New features (indices 7-9):
-      f8  boxes_from_dest: boxes in blast radius of a default bomb placed at
-          destination. Zero for STOP. For movement, this previews 'if I move
-          here and then bomb, how much board control do I gain?'
+    New features (indices 7-10):
+      f8  boxes_from_dest: boxes in blast radius of a bomb placed at destination,
+          using the agent's actual radius. Zero for PLACE_BOMB (already in bval_n).
 
-      f9  escape_exits_from_dest: number of walkable non-danger neighbours from
-          destination (proxy for how trapped the agent becomes after this move).
-          Normalised by 4.
+      f9  escape_exits_from_dest: walkable non-danger neighbours at destination.
+          Normalised by 4. Proxy for "how trapped am I after moving here?"
 
       f10 enemy_dist_from_dest: normalised BFS distance to nearest live enemy
           from destination. Closer = higher combat relevance.
+
+      f11 dest_in_hyp_danger: 1.0 if the destination falls inside the blast zone
+          of any armed enemy who hypothetically drops a bomb right now.
+          Soft safety signal — not used as a hard gate.
     """
     # Base 7 features from v1
     base = list(_encode_candidate_features(
@@ -135,8 +137,6 @@ def _encode_candidate_features_v2(action, my_r, my_c, my_radius,
         danger_any, bomb_pos, danger_by_time,
         obs_bombs
     ))
-    # Drop the trailing 0.0 padding (last element of base is always 0.0 spare)
-    # and extend with 3 new features.
 
     h, w = grid.shape
 
@@ -147,7 +147,7 @@ def _encode_candidate_features_v2(action, my_r, my_c, my_radius,
         dr, dc = MOVES[action]
         nr, nc = my_r + dr, my_c + dc
 
-    # f8: boxes in blast radius from destination (using agent's current radius)
+    # f8: boxes in blast radius from destination (using agent's actual radius)
     if action == PLACE_BOMB:
         # Already captured in bval_n (feature 4); use 0 to avoid double-encoding
         boxes_from_dest = 0.0
@@ -189,7 +189,11 @@ def _encode_candidate_features_v2(action, my_r, my_c, my_radius,
                     vis.add(np2)
                     q.append((np2, d + 1))
 
-    return base + [boxes_from_dest, open_safe_at_dest, enemy_dist_dest]
+    # f11: destination in hypothetical enemy danger (soft signal, not a gate)
+    _, hyp_any = _build_hypothetical_danger(players, agent_id, grid)
+    dest_in_hyp_danger = float((nr, nc) in hyp_any)
+
+    return base + [boxes_from_dest, open_safe_at_dest, enemy_dist_dest, dest_in_hyp_danger]
 
 
 
@@ -286,6 +290,7 @@ def _build_danger_timed(obs):
         danger_any        |= b['tiles']
 
     return danger_by_time, danger_any
+
 
 
 # =============================================================================
@@ -776,11 +781,13 @@ def _safe_fallback(pos, grid, bomb_pos, danger_by_time, step_count, agent_id,
 # Box targeting  (F6: prefer spots adjacent to multiple boxes)
 # =============================================================================
 
-def _scored_box_spots(grid, bomb_pos, danger_any):
+def _scored_box_spots(grid, bomb_pos, danger_any, my_radius=1):
     """
-    Returns list of (score, (r,c)) for all box-adjacent safe spots.
+    Returns dict of (r,c)->score for all box-adjacent safe spots.
     F6: score = number of distinct boxes reachable via bomb from that spot.
     Higher = more chain value.
+    FIX: uses my_radius instead of hardcoded 1, so agent radius upgrades
+    are correctly reflected in box-spot scoring.
     """
     h, w = grid.shape
     spot_scores = {}
@@ -793,15 +800,46 @@ def _scored_box_spots(grid, bomb_pos, danger_any):
                 if grid[nr,nc] in (WALL,BOX): continue
                 if (nr,nc) in bomb_pos: continue
                 if (nr,nc) in danger_any: continue
-                # count boxes a default-radius bomb would hit from here
+                # count boxes the agent's actual bomb radius would hit from here
                 box_count = sum(
-                    1 for tr,tc in _blast_tiles(nr,nc,1,grid)
+                    1 for tr,tc in _blast_tiles(nr,nc,my_radius,grid)
                     if grid[tr,tc] == BOX
                 )
                 prev = spot_scores.get((nr,nc), 0)
                 spot_scores[(nr,nc)] = max(prev, box_count)
 
     return spot_scores  # dict (r,c)->score
+
+
+# =============================================================================
+# Hypothetical danger map  (every armed enemy drops a bomb right now)
+# =============================================================================
+
+def _build_hypothetical_danger(players, agent_id, grid):
+    """
+    Imagine every live, armed enemy drops a bomb RIGHT NOW.
+    Returns (hyp_danger_by_time, hyp_danger_any) as a SEPARATE map —
+    does NOT replace danger_by_time.  Used only as a soft candidate feature.
+    """
+    n = len(players)
+    hyp_bombs = []
+    for i, p in enumerate(players):
+        if i == agent_id: continue
+        if int(p[2]) != 1: continue    # dead
+        if int(p[3]) <= 0: continue    # no bombs left
+        er, ec = int(p[0]), int(p[1])
+        radius = max(1, min(MAX_RADIUS, 1 + int(p[4])))
+        tiles  = _blast_tiles(er, ec, radius, grid)
+        hyp_bombs.append({'timer': BOMB_TIMER, 'tiles': tiles})
+
+    hyp_dbt = {}
+    hyp_any = set()
+    for b in hyp_bombs:
+        t = b['timer']
+        hyp_dbt.setdefault(t, set())
+        hyp_dbt[t] |= b['tiles']
+        hyp_any    |= b['tiles']
+    return hyp_dbt, hyp_any
 
 
 # =============================================================================
@@ -1228,7 +1266,7 @@ class Agent:
 
         # Priority 4: farm boxes — F6 prefer high-cluster spots
         if time.perf_counter()-t0 < TIME_BUDGET_S:
-            spot_scores = _scored_box_spots(grid,bomb_pos,danger_any)
+            spot_scores = _scored_box_spots(grid,bomb_pos,danger_any,my_radius)
             if spot_scores and pos not in spot_scores:
                 # try best cluster spots first, fall back to any box spot
                 best_val  = max(spot_scores.values())
