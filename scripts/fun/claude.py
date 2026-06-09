@@ -67,13 +67,10 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
-from scripts.training.bomberv2 import SimpleRuleAgent
-
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.getcwd())
 
 # ── Import game engine ────────────────────────────────────────────────────────
-from agent.random_agent import RandomAgent
 from engine.game import BomberEnv   # adjust path if needed
 
 # ── Import the rule agent internals ──────────────────────────────────────────
@@ -196,23 +193,27 @@ def collect_dataset(n_games=N_GAMES, verbose=True):
         env      = BomberEnv(max_steps=MAX_STEPS, seed=map_seed)
         obs      = env.reset()
         
-        my_lucky_id = random.randint(0, 3)
+        agents = [MyTrainingAgent(0)]
         
-        agents = [None] * 4
-        agents[my_lucky_id] = MyTrainingAgent(my_lucky_id) # Xếp Bot mình vào vị trí ngẫu nhiên đó
-        
-        # Điền các đối thủ từ pool vào các vị trí trống còn lại
-        for i in range(4):
-            if i == my_lucky_id:
-                continue
-                
-            pool_choice = random.choice(["random", "simple", "smarter", "tactical", "genius", "samnu", "myself"])
-
-            if pool_choice == "smarter": agents[i] = SmarterRuleAgent(i)
-            elif pool_choice == "tactical": agents[i] = TacticalRuleAgent(i)
-            elif pool_choice == "genius": agents[i] = GeniusRuleAgent(i)
-            elif pool_choice == "samnu": agents[i] = SamnuAgent(i)
-            else: agents[i] = MyTrainingAgent(i)
+        for i in range(1, 4):
+            pool_choice = random.choice([
+                "smarter", 
+                "tactical", 
+                "genius", 
+                "samnu",
+                "myself" # Cho đấu với chính bản thân mình luôn
+            ])
+            
+            if pool_choice == "smarter":
+                agents.append(SmarterRuleAgent(i))
+            elif pool_choice == "tactical":
+                agents.append(TacticalRuleAgent(i))
+            elif pool_choice == "genius":
+                agents.append(GeniusRuleAgent(i))
+            elif pool_choice == "samnu":
+                agents.append(SamnuAgent(i))
+            else:
+                agents.append(MyTrainingAgent(i))
 
         # Per-agent episode buffers: list of (state_ctx, cand_feat, step_reward)
         ep_bufs  = [[] for _ in range(4)]
