@@ -129,7 +129,7 @@ MAX_STEPS        = 500      # max game steps
 DATASET_PATH     = "scorer_dataset_v2.npz"
 SCORER_PATH      = "./agent/submission_v1/scorer.pt"
 BEST_PATH        = "./agent/submission_v1/scorer_best.pt"
-SEED             = 42
+SEED             = 142
 
 # v2 training options
 USE_COUNTERFACTUAL_LABELS = True   # Fix 1: per-candidate labels instead of shared return
@@ -896,7 +896,7 @@ def _print_deployment_note():
 
 def main():
     parser = argparse.ArgumentParser(description="Train ScorerNetV2 for hybrid Bomberland agent")
-    parser.add_argument("--n-games",       type=int,  default=3000,
+    parser.add_argument("--n-games",       type=int,  default=5500,
                         help="self-play games to collect")
     parser.add_argument("--epochs",        type=int,  default=TRAIN_EPOCHS,
                         help="training epochs")
