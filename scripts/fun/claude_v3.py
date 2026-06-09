@@ -137,7 +137,7 @@ USE_RANKING_LOSS          = True   # Fix 2: pairwise Bradley-Terry loss instead 
 RANKING_MARGIN            = 0.05   # minimum return difference to count as a preference
 
 # Fixed map seeds: training / eval split
-N_TRAIN_MAPS     = 200
+N_TRAIN_MAPS     = 300
 N_EVAL_MAPS      = 50
 _TRAIN_SEEDS     = [300_000 + i*137 for i in range(N_TRAIN_MAPS)]
 _EVAL_SEEDS      = [900_000 + i*137 for i in range(N_EVAL_MAPS)]
@@ -896,11 +896,11 @@ def _print_deployment_note():
 
 def main():
     parser = argparse.ArgumentParser(description="Train ScorerNetV2 for hybrid Bomberland agent")
-    parser.add_argument("--n-games",       type=int,  default=1000,
+    parser.add_argument("--n-games",       type=int,  default=3000,
                         help="self-play games to collect")
     parser.add_argument("--epochs",        type=int,  default=TRAIN_EPOCHS,
                         help="training epochs")
-    parser.add_argument("--rounds",        type=int,  default=3,
+    parser.add_argument("--rounds",        type=int,  default=4,
                         help="iterative refinement rounds (1 = single pass)")
     parser.add_argument("--skip-collect",  action="store_true",
                         help="skip data collection, load existing dataset")
